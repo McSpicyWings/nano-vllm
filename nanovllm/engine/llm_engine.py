@@ -29,6 +29,12 @@ class LLMEngine:
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        # tokenizer_path = kwargs.get("tokenizer", config.model)
+        # try:
+        #     self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
+        # except Exception:
+        #     # Fall back to slow tokenizer if fast conversion is unsupported (common for eagle3 drafts without tiktoken files).
+        #     self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
