@@ -62,7 +62,7 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-def postprocess(self, seqs: list[Sequence], token_ids: list[int] | list[list[int]]):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int] | list[list[int]]):
         # NOTE: speculative decoding may return multiple tokens per sequence.
         # For the legacy path, token_ids is a flat list[int].
         if not token_ids:
