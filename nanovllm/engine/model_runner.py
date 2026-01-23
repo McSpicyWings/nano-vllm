@@ -1,3 +1,4 @@
+from nanovllm.models.eagle3 import Eagle3ForCausalLM
 import pickle
 import torch
 import torch.distributed as dist
@@ -30,6 +31,25 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        
+        # Optional draft model (Eagle3 1-layer) for speculative decoding.
+        self.draft_model: Eagle3ForCausalLM | None = None
+        self.speculative_k: int = getattr(config, "speculative_k", 1)
+        # Per-sequence draft token history (draft vocab ids).
+        self._draft_state: dict[int, list[int]] = {}
+        # Debug stash: last proposed target-vocab tokens per sequence.
+        self._draft_proposals: dict[int, list[int]] = {}
+
+        if getattr(config, "draft_model", None):
+            draft_hf_config = getattr(config, "draft_hf_config", None)
+            if draft_hf_config is None:
+                from transformers import AutoConfig
+                draft_hf_config = AutoConfig.from_pretrained(config.draft_model)
+            self.draft_model = Eagle3ForCausalLM(draft_hf_config)
+            # Draft checkpoint is usually pytorch_model.bin; allow extra keys.
+            load_model(self.draft_model, config.draft_model, strict=False)
+        
+        
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -186,6 +206,127 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    # =========================
+    # Draft-model helpers (Eagle3)
+    # =========================
+    def _init_draft_state(self, seqs: list[Sequence]):
+        """Initialize draft token history for sequences."""
+        if self.draft_model is None:
+            return
+        missing = [seq for seq in seqs if seq.seq_id not in self._draft_state]
+        if not missing:
+            return
+
+        flat_target_ids: list[int] = []
+        lens: list[int] = []
+        for seq in missing:
+            if hasattr(seq, "token_ids"):
+                lens.append(len(seq.token_ids))
+                flat_target_ids.extend(seq.token_ids)
+            else:
+                lens.append(1)
+                flat_target_ids.append(int(getattr(seq, "last_token", 0)))
+
+        target_ids = torch.tensor(flat_target_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        draft_ids = self.draft_model.map_target_to_draft(target_ids)
+        draft_ids_list = draft_ids.tolist()
+
+        offset = 0
+        for seq, l in zip(missing, lens):
+            self._draft_state[seq.seq_id] = draft_ids_list[offset: offset + l]
+            offset += l
+
+    def _append_committed_tokens_to_draft_state(self, seqs: list[Sequence], committed_target_ids: torch.Tensor):
+        """Append committed target tokens into local draft-state (as draft ids)."""
+        if self.draft_model is None:
+            return
+        draft_ids = self.draft_model.map_target_to_draft(committed_target_ids)
+        draft_ids_list = draft_ids.tolist()
+        for seq, did in zip(seqs, draft_ids_list):
+            hist = self._draft_state.get(seq.seq_id)
+            if hist is None:
+                self._draft_state[seq.seq_id] = [did]
+            else:
+                hist.append(did)
+
+    def _prepare_draft_prefill(self, base: list[list[int]], proposed: list[list[int]]):
+        """Build a varlen prefill batch for the draft model."""
+        input_ids: list[int] = []
+        positions: list[int] = []
+        cu: list[int] = [0]
+        max_seqlen = 0
+        for b, p in zip(base, proposed):
+            seqlen = len(b) + len(p)
+            if seqlen == 0:
+                seqlen = 1
+                b = [0]
+                p = []
+            input_ids.extend(b)
+            input_ids.extend(p)
+            positions.extend(range(seqlen))
+            cu.append(cu[-1] + seqlen)
+            max_seqlen = max(max_seqlen, seqlen)
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_t = torch.tensor(cu, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.empty(0, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_t, cu_t, max_seqlen, max_seqlen, slot_mapping, None, None)
+        return input_ids_t, positions_t
+
+    @torch.inference_mode()
+    def _draft_propose(self, seqs: list[Sequence], k: int) -> list[list[int]] | None:
+        """Propose k tokens with the draft model."""
+        if self.draft_model is None or k <= 0:
+            return None
+
+        self._init_draft_state(seqs)
+        base = [self._draft_state.get(seq.seq_id, []) for seq in seqs]
+
+        proposed_draft: list[list[int]] = [[] for _ in seqs]
+        proposed_target: list[list[int]] | None = [[] for _ in seqs] if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        for _ in range(k):
+            input_ids_t, positions_t = self._prepare_draft_prefill(base, proposed_draft)
+            logits = self.draft_model.compute_logits(self.draft_model(input_ids_t, positions_t))
+
+            if self.rank == 0:
+                next_draft = self.sampler(logits, temperatures)
+            else:
+                next_draft = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
+            if self.world_size > 1:
+                dist.broadcast(next_draft, 0)
+
+            next_draft_list = next_draft.tolist()
+            for lst, tok in zip(proposed_draft, next_draft_list):
+                lst.append(tok)
+
+            if self.rank == 0 and proposed_target is not None:
+                next_target = self.draft_model.map_draft_to_target(next_draft).tolist()
+                for lst, tok in zip(proposed_target, next_target):
+                    lst.append(tok)
+
+            reset_context()
+
+        if self.rank == 0 and proposed_target is not None:
+            for seq, toks in zip(seqs, proposed_target):
+                self._draft_proposals[seq.seq_id] = toks
+            return proposed_target
+        return None
+
+    def run_speculative(self, seqs: list[Sequence], is_prefill: bool):
+        """Speculative decoding entrypoint (Step2: propose only)."""
+        token_ids = self.run(seqs, is_prefill)
+        if (not is_prefill) and (self.draft_model is not None) and self.speculative_k > 0:
+            self._draft_propose(seqs, self.speculative_k)
+        if self.rank != 0:
+            return None
+        return [[t] for t in token_ids]
+    # =========================
+    # Draft-model helpers end(Eagle3)
+    # =========================
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
@@ -209,8 +350,31 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        
+        # NOTE: for TP, only rank0 has full logits (ParallelLMHead gathers to rank0).
+        if self.rank == 0:
+            token_ids_t = self.sampler(logits, temperatures)
+        else:
+            token_ids_t = None
+
+        # When draft-model is enabled, every rank needs committed token ids to keep
+        # its local draft-state in sync.
+        if self.draft_model is not None:
+            if token_ids_t is None:
+                token_ids_t = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
+            if self.world_size > 1:
+                dist.broadcast(token_ids_t, 0)
+
+        token_ids = token_ids_t.tolist() if self.rank == 0 else None
         reset_context()
+
+        # Maintain per-sequence draft history (only for real sequences; skip warmup).
+        if self.draft_model is not None and any(seq.block_table for seq in seqs):
+            if is_prefill:
+                self._init_draft_state(seqs)
+            if token_ids_t is not None:
+                self._append_committed_tokens_to_draft_state(seqs, token_ids_t)
+
         return token_ids
 
     def run_speculative(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
