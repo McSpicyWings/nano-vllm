@@ -62,10 +62,29 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+def postprocess(self, seqs: list[Sequence], token_ids: list[int] | list[list[int]]):
+        # NOTE: speculative decoding may return multiple tokens per sequence.
+        # For the legacy path, token_ids is a flat list[int].
+        if not token_ids:
+            return
+        if isinstance(token_ids[0], int):
+            token_ids = [[t] for t in token_ids]  # type: ignore[list-item]
+
+        for seq, token_id_list in zip(seqs, token_ids):
+            for i, token_id in enumerate(token_id_list):
+                # Scheduler.schedule() already called BlockManager.may_append(seq) for the
+                # first appended token during decode. For additional tokens in the same step,
+                # we need to update block_table / allocate blocks as needed.
+                if i > 0:
+                    # If we need a new KV-cache block but cannot allocate it right now, stop
+                    # committing further tokens for this sequence.
+                    if not self.block_manager.can_append(seq):
+                        break
+                    self.block_manager.may_append(seq)
+
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    break

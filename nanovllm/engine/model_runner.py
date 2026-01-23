@@ -213,6 +213,19 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def run_speculative(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]]:
+        """Step 1: speculative decoding scaffold.
+
+        Later steps will run a draft model to propose multiple tokens, then verify them
+        with the target model. For now, we keep the exact same behavior as the legacy
+        path, but return the tokens in a nested list format: one (possibly) token-list
+        per sequence.
+        """
+        token_ids = self.run(seqs, is_prefill)
+        if self.rank == 0:
+            return [[t] for t in token_ids]
+        return None
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
