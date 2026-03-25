@@ -4,11 +4,11 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    path = os.path.expanduser("~/huggingface/AngelSlim/Qwen3-1.7B_eagle3")
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
-
+    tpath = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    dpath = os.path.expanduser("~/huggingface/AngelSlim/Qwen3-1.7B_eagle3")
+    tokenizer = AutoTokenizer.from_pretrained(tpath)
+    llm = LLM(tpath, tensor_parallel_size=1)
+    # llm = LLM(tpath, draft_model=dpath, max_model_len=4096, num_spec_tokens=3, )
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",

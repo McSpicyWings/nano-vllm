@@ -53,6 +53,57 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    # ---- Speculative helpers ----
+    def num_blocks_for_tokens(self, num_tokens: int) -> int:
+        return (num_tokens + self.block_size - 1) // self.block_size
+
+    def can_reserve(self, seq: Sequence, num_new_tokens: int) -> bool:
+        target_tokens = len(seq) + num_new_tokens
+        target_blocks = self.num_blocks_for_tokens(target_tokens)
+        extra_blocks = max(0, target_blocks - len(seq.block_table))
+        return len(self.free_block_ids) >= extra_blocks
+
+    def reserve(self, seq: Sequence, num_new_tokens: int) -> int:
+        target_tokens = len(seq) + num_new_tokens
+        target_blocks = self.num_blocks_for_tokens(target_tokens)
+        added = 0
+        while len(seq.block_table) < target_blocks:
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+            added += 1
+        return added
+
+    def rollback_to(self, seq: Sequence, num_tokens_executed: int) -> None:
+        target_blocks = self.num_blocks_for_tokens(num_tokens_executed)
+        while len(seq.block_table) > target_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+    def ensure_prev_full_block_hashed_if_needed(self, seq: Sequence) -> None:
+        # If next step would allocate a new block (len % block_size == 1), make sure the
+        # previous full block has a valid hash so that may_append assertions hold.
+        if len(seq) % self.block_size != 1 or not seq.block_table:
+            return
+
+        last_block_id = seq.block_table[-1]
+        last_block = self.blocks[last_block_id]
+        if last_block.hash != -1:
+            return
+
+        logical_block_idx = len(seq.block_table) - 1
+        start = logical_block_idx * self.block_size
+        token_ids = seq.token_ids[start: start + self.block_size]
+        assert len(token_ids) == self.block_size
+
+        prefix_hash = self.blocks[seq.block_table[-2]].hash if logical_block_idx > 0 else -1
+        h = self.compute_hash(token_ids, prefix_hash)
+        last_block.update(h, token_ids)
+        self.hash_to_block_id[h] = last_block_id
+
     def can_allocate(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= seq.num_blocks
 

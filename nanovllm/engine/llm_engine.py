@@ -1,4 +1,6 @@
 import atexit
+import gc
+import torch
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -37,13 +39,32 @@ class LLMEngine:
         #     self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._exited = False
+        self._atexit_registered = True
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        if self._exited:
+            return
+        self._exited = True
+        if self._atexit_registered:
+            try:
+                atexit.unregister(self.exit)
+            except Exception:
+                pass
+            self._atexit_registered = False
+        try:
+            if hasattr(self, "model_runner") and self.model_runner is not None:
+                self.model_runner.call("exit")
+        finally:
+            if hasattr(self, "model_runner"):
+                del self.model_runner
+            for p in self.ps:
+                p.join()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -56,7 +77,16 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        
+        # Calculate num_tokens for throughput tracking
+        if is_prefill:
+            num_tokens = sum(len(seq) for seq in seqs)
+        else:
+            # For decode, count actual tokens generated (may be multiple with spec decode)
+            if token_ids and isinstance(token_ids[0], list):
+                num_tokens = -sum(len(toks) for toks in token_ids)
+            else:
+                num_tokens = -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):

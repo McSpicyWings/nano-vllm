@@ -10,9 +10,10 @@ from nanovllm.layers.linear import (
     QKVParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    ReplicatedLinear,
 )
 from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead, compute_logits_with_mapping
 
 
 class LlamaEagle3Attention(nn.Module):
@@ -227,11 +228,28 @@ class LlamaEagle3ForCausalLM(nn.Module):
         config: LlamaConfig,
     ) -> None:
         super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
         self.model = LlamaEagle3Model(config)
-        vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
-        self.lm_head = ParallelLMHead(vocab_size, config.hidden_size)
-        if getattr(config, "tie_word_embeddings", True):
+        # Draft vocab size may differ from target vocab size
+        self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
+        self.target_vocab_size = getattr(config, "target_vocab_size", config.vocab_size)
+        self.lm_head = ParallelLMHead(self.draft_vocab_size, config.hidden_size)
+        tie_embeddings = getattr(config, "tie_word_embeddings", True) and self.draft_vocab_size == config.vocab_size
+        if tie_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        
+        # fc layer for Eagle3 speculator: fuses (prev_hidden, curr_hidden, embed) -> hidden
+        # Input: 3 * hidden_size (concat of prev_hidden + curr_hidden + embed)
+        # Output: hidden_size
+        self.fc = ReplicatedLinear(
+            input_size=3 * config.hidden_size,
+            output_size=config.hidden_size,
+            bias=False,
+        )
+        
+        # Optional: vocab mapping tensor for draft->target vocab (loaded from config or file)
+        self.vocab_mapping: torch.Tensor | None = None
 
     def forward(
         self,
@@ -239,10 +257,86 @@ class LlamaEagle3ForCausalLM(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(input_ids, positions)
+    
+    def forward_with_hidden(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        prev_hidden_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that accepts previous hidden states for multi-step speculative drafting.
+        
+        Args:
+            input_ids: [N] input token ids
+            positions: [N] position indices
+            prev_hidden_states: [N, H] hidden states from previous step (None for first step)
+        
+        Returns:
+            hidden_states: [N, H] output hidden states
+            fused_hidden: [N, H] fused hidden states (for passing to next step)
+        """
+        embeds = self.model.embed_input_ids(input_ids)
+        hidden_states = embeds
+        
+        if prev_hidden_states is not None:
+            # Fuse previous hidden, current hidden (embeds initially), and embed
+            # using the fc layer: [prev_hidden, curr_hidden, embed] -> fused
+            fused_input = torch.cat([prev_hidden_states, hidden_states, embeds], dim=-1)
+            hidden_states = self.fc(fused_input)
+        
+        residual = None
+        for layer in self.model.layers:
+            hidden_states, residual = layer(positions, embeds, hidden_states, residual)
+        hidden_states, _ = self.model.norm(hidden_states, residual)
+        
+        return hidden_states, hidden_states  # Return hidden_states as both output and state for next step
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute logits in draft vocab space."""
         logits = self.lm_head(hidden_states)
         return logits
+    
+    def compute_logits_mapped(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute logits and map them to target vocab space.
+        Used during speculative decoding verification.
+        
+        Args:
+            hidden_states: [N, H] hidden states
+        
+        Returns:
+            target_logits: [N, target_vocab] logits in target vocab space
+        """
+        draft_logits = self.lm_head(hidden_states)
+        if draft_logits is None:  # Non-rank-0 in TP
+            return None
+        
+        # If draft and target vocab are the same, no mapping needed
+        if self.draft_vocab_size == self.target_vocab_size and self.vocab_mapping is None:
+            return draft_logits
+        
+        # Map draft logits to target vocab space
+        target_logits = compute_logits_with_mapping(
+            draft_logits,
+            self.draft_vocab_size,
+            self.target_vocab_size,
+            self.vocab_mapping,
+        )
+        return target_logits
+    
+    def set_vocab_mapping(self, mapping: torch.Tensor):
+        """
+        Set the vocab mapping tensor for draft->target vocabulary.
+        
+        Args:
+            mapping: [draft_vocab] tensor where mapping[i] = target token id for draft token i
+                     Use -1 to indicate no mapping exists.
+        """
+        self.vocab_mapping = mapping

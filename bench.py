@@ -11,10 +11,16 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    path = os.path.expanduser("~/huggingface/AngelSlim/Qwen3-1.7B_eagle3")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
-
+    target_path = os.path.expanduser("./huggingface/Qwen3-1.7B/")
+    draft_path = os.path.expanduser("./huggingface/AngelSlim/Qwen3-1.7B_eagle3")
+    # llm = LLM(target_path, enforce_eager=False, max_model_len=4096)
+    llm = LLM(
+            target_path,
+            draft_model=draft_path,
+            enforce_eager=False,
+            max_model_len=4096,
+            num_spec_tokens=5,
+        )
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
     # uncomment the following line for vllm

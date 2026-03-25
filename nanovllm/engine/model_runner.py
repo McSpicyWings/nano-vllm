@@ -23,6 +23,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self._exited = False
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -58,15 +59,37 @@ class ModelRunner:
 
     # Tear down caches, CUDA graphs, and process group resources.
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
+            try:
+                self.shm.close()
+            except Exception:
+                pass
+            try:
+                dist.barrier()
+            except Exception:
+                pass
             if self.rank == 0:
-                self.shm.unlink()
+                try:
+                    self.shm.unlink()
+                except Exception:
+                    pass
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
+            try:
+                del self.graphs, self.graph_pool
+            except Exception:
+                pass
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
     # 处理model和draft model
     def _build_model(self, hf_config):
@@ -219,6 +242,70 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    # Prepare decode inputs for a virtual step within a speculative draft cycle.
+    def prepare_decode_step(self, seqs: list[Sequence], input_token_ids: torch.Tensor, step_offset: int):
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            pos = (len(seq) - 1) + step_offset
+            positions.append(pos)
+            context_lens.append(len(seq) + step_offset)
+            block_idx = pos // self.block_size
+            slot_in_block = pos % self.block_size
+            slot_mapping.append(seq.block_table[block_idx] * self.block_size + slot_in_block)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_token_ids, positions
+
+    # Prepare a single prefill call that verifies pending + draft tokens (k+1 queries each).
+    def prepare_spec_verify(self, seqs: list[Sequence], draft_tokens: torch.Tensor, k: int):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        for b, seq in enumerate(seqs):
+            base_pos = len(seq) - 1
+            q_len = k + 1
+            k_len = len(seq) + k
+            cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + k_len)
+            max_seqlen_q = max(max_seqlen_q, q_len)
+            max_seqlen_k = max(max_seqlen_k, k_len)
+            # j=0 pending token, j>=1 draft token j-1
+            for j in range(q_len):
+                pos = base_pos + j
+                token = seq.last_token if j == 0 else draft_tokens[b, j - 1].item()
+                input_ids.append(token)
+                positions.append(pos)
+                block_idx = pos // self.block_size
+                slot_in_block = pos % self.block_size
+                slot_mapping.append(seq.block_table[block_idx] * self.block_size + slot_in_block)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            prefill_last_only=False,
+        )
+        return input_ids, positions
+
     # Assemble temperatures tensor on rank 0 for sampling.
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -254,21 +341,123 @@ class ModelRunner:
         # Draft path uses eager for simplicity; decode batches are small in speculative flow.
         return self.draft_model.compute_logits(self.draft_model(input_ids, positions))
 
+    # Draft propose pass: generate k draft tokens (one token per micro-step).
+    @torch.inference_mode()
+    def propose_draft_tokens(
+        self,
+        seqs: list[Sequence],
+        k: int,
+        temperatures: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        assert self.draft_model is not None
+        bs = len(seqs)
+        draft_tokens = torch.empty((bs, k), dtype=torch.int64, device="cuda")
+        cur_tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, device="cuda")
+        draft_step_logits = [] if self.rank == 0 else None
+
+        for step in range(k):
+            input_ids, positions = self.prepare_decode_step(seqs, cur_tokens, step)
+            logits = self.run_draft_model(input_ids, positions, is_prefill=False)
+            if self.rank == 0:
+                draft_step_logits.append(logits)
+                next_tok = self.sampler(logits, temperatures)
+            else:
+                next_tok = torch.empty((bs,), dtype=torch.int64, device="cuda")
+            if self.world_size > 1:
+                dist.broadcast(next_tok, src=0)
+            draft_tokens[:, step] = next_tok
+            cur_tokens = next_tok
+        reset_context()
+        return draft_tokens, draft_step_logits
+
+    # Accept/reject draft tokens using target logits (exact speculative decoding).
+    @torch.inference_mode()
+    def accept_draft_tokens(
+        self,
+        seqs: list[Sequence],
+        draft_tokens: torch.Tensor,
+        draft_step_logits: list[torch.Tensor],
+        target_logits: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> list[list[int]]:
+        bs, k = draft_tokens.shape
+        target_logits = target_logits.view(bs, k + 1, -1)
+        scaled_target = target_logits.float() / temperatures[:, None, None]
+        log_probs_p = torch.log_softmax(scaled_target, dim=-1)
+        log_probs_q = [torch.log_softmax(step_logits.float() / temperatures[:, None], dim=-1) for step_logits in draft_step_logits]
+
+        out_tokens_per_seq: list[list[int]] = []
+        for b in range(bs):
+            accepted_tokens: list[int] = []
+            reject_step = None
+            for step in range(k):
+                y = draft_tokens[b, step]
+                lp = log_probs_p[b, step, y]
+                lq = log_probs_q[step][b, y]
+                a = torch.exp(lp - lq).clamp(max=1.0)
+                if torch.rand((), device=lp.device) <= a:
+                    accepted_tokens.append(int(y.item()))
+                else:
+                    reject_step = step
+                    break
+
+            if reject_step is not None:
+                logits_p_step = log_probs_p[b, reject_step]
+                logits_q_step = log_probs_q[reject_step][b]
+                dist_p = torch.distributions.Categorical(logits=logits_p_step)
+                while True:
+                    x = dist_p.sample()
+                    if x >= logits_q_step.numel():
+                        z = int(x.item())
+                        break
+                    lp_x = logits_p_step[x]
+                    lq_x = logits_q_step[x]
+                    alpha = torch.clamp(1 - torch.exp(lq_x - lp_x), min=0.0, max=1.0)
+                    if torch.rand((), device=alpha.device) <= alpha:
+                        z = int(x.item())
+                        break
+                out_tokens = accepted_tokens + [z]
+            else:
+                dist_p = torch.distributions.Categorical(logits=log_probs_p[b, k])
+                z = int(dist_p.sample().item())
+                out_tokens = accepted_tokens + [z]
+            out_tokens_per_seq.append(out_tokens)
+        return out_tokens_per_seq
+
     # End-to-end run: prepare inputs, run model, sample tokens (on rank 0), and reset context.
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run_baseline(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        # Optional single-step draft: run draft forward to populate its KV cache and propose tokens.
-        if self.draft_model is not None:
-            draft_logits = self.run_draft_model(input_ids, positions, is_prefill)
-            draft_token_ids = self.sampler(draft_logits, temperatures).tolist() if (self.rank == 0 and not is_prefill) else None
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+
+        if self.draft_model is not None and is_prefill:
+            _ = self.run_draft_model(input_ids, positions, is_prefill)
+
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        # For now, accept draft token only when it matches the target sample (keeps distribution correct without extra checks).
-        if self.rank == 0 and not is_prefill and self.draft_model is not None and draft_token_ids is not None:
-            token_ids = [draft if draft == tgt else tgt for draft, tgt in zip(draft_token_ids, token_ids)]
         reset_context()
+        if token_ids is None:
+            return None
+        return [[t] for t in token_ids]
+
+    def run_spec_decode(self, seqs: list[Sequence]) -> list[list[int]] | None:
+        assert self.draft_model is not None
+        k = getattr(self.config, "num_spec_tokens", 0)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        draft_tokens, draft_step_logits = self.propose_draft_tokens(seqs, k, temperatures)
+        input_ids, positions = self.prepare_spec_verify(seqs, draft_tokens, k)
+        target_logits = self.run_model(input_ids, positions, is_prefill=True)
+        reset_context()
+
+        if self.rank != 0:
+            return None
+        token_ids = self.accept_draft_tokens(seqs, draft_tokens, draft_step_logits, target_logits, temperatures)
         return token_ids
+
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
+        if is_prefill or self.draft_model is None or self.config.num_spec_tokens <= 0:
+            return self.run_baseline(seqs, is_prefill)
+        return self.run_spec_decode(seqs)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

@@ -6,6 +6,53 @@ import torch.distributed as dist
 from nanovllm.utils.context import get_context
 
 
+def compute_logits_with_mapping(
+    draft_logits: torch.Tensor,
+    draft_vocab_size: int,
+    target_vocab_size: int,
+    vocab_mapping: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Map draft model logits to target model vocab space.
+    
+    Args:
+        draft_logits: [N, draft_vocab] logits from draft model
+        draft_vocab_size: vocab size of the draft model
+        target_vocab_size: vocab size of the target model
+        vocab_mapping: Optional [draft_vocab] tensor mapping draft token ids to target token ids.
+                       If None, assumes identity mapping for overlapping tokens.
+    
+    Returns:
+        target_logits: [N, target_vocab] with -inf for unmapped positions
+    """
+    N = draft_logits.size(0)
+    device = draft_logits.device
+    dtype = draft_logits.dtype
+    
+    # Initialize with -inf (tokens not covered by draft model are impossible)
+    target_logits = torch.full(
+        (N, target_vocab_size),
+        float('-inf'),
+        device=device,
+        dtype=dtype,
+    )
+    
+    if vocab_mapping is not None:
+        # Use explicit mapping: vocab_mapping[draft_idx] = target_idx
+        # -1 in mapping means no corresponding target token
+        valid_mask = vocab_mapping >= 0
+        valid_draft_indices = torch.arange(draft_vocab_size, device=device)[valid_mask]
+        valid_target_indices = vocab_mapping[valid_mask]
+        target_logits[:, valid_target_indices] = draft_logits[:, valid_draft_indices]
+    else:
+        # Identity mapping: draft token i maps to target token i
+        # Only map up to min(draft_vocab, target_vocab)
+        overlap_size = min(draft_vocab_size, target_vocab_size)
+        target_logits[:, :overlap_size] = draft_logits[:, :overlap_size]
+    
+    return target_logits
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -55,7 +102,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        # Prefill returns all logits when prefill_last_only is False (needed for spec verify).
+        if context.is_prefill and context.prefill_last_only:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
