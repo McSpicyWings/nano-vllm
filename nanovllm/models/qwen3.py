@@ -173,12 +173,35 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        return_aux_hidden_states: bool = False,
+        aux_hidden_state_layer_ids: list[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_list = []
+        aux_capture_ids: list[int] = []
+        aux_capture_set: set[int] = set()
+        if return_aux_hidden_states:
+            if aux_hidden_state_layer_ids is None:
+                num_layers = len(self.layers)
+                aux_hidden_state_layer_ids = [1, num_layers // 2, num_layers - 4]
+            aux_capture_ids = [idx for idx in aux_hidden_state_layer_ids if 0 <= idx < len(self.layers)]
+            aux_capture_set = set(aux_capture_ids)
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if layer_idx in aux_capture_set:
+                aux_list.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if return_aux_hidden_states:
+            if aux_capture_ids:
+                aux_by_layer = {
+                    idx: hidden for idx, hidden in zip(sorted(aux_capture_ids), aux_list)
+                }
+                ordered_aux = [aux_by_layer[idx] for idx in aux_capture_ids]
+                aux_hidden_states = torch.cat(ordered_aux, dim=-1)
+            else:
+                aux_hidden_states = hidden_states.new_zeros(hidden_states.size(0), 0)
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -205,8 +228,19 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return_aux_hidden_states: bool = False,
+        aux_hidden_state_layer_ids: list[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.model(
+            input_ids,
+            positions,
+            return_aux_hidden_states=return_aux_hidden_states,
+            aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
+        )
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(
         self,

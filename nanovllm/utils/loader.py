@@ -66,8 +66,9 @@ def load_model(model: nn.Module, path: str):
             # Optional vocab mappings: d2t maps draft->target ids, t2d maps target->draft ids.
             if hasattr(model, "set_vocab_mapping") and "d2t" in state_dict:
                 model.set_vocab_mapping(state_dict.pop("d2t").long())
-            # t2d is not currently consumed; keep as attribute for debugging if present.
-            if "t2d" in state_dict:
+            if hasattr(model, "set_target_to_draft_mapping") and "t2d" in state_dict:
+                model.set_target_to_draft_mapping(state_dict.pop("t2d").long())
+            elif "t2d" in state_dict:
                 setattr(model, "t2d", state_dict.pop("t2d"))
 
             loaded_any = True

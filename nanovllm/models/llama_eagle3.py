@@ -204,9 +204,11 @@ class LlamaEagle3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         embeds = self.embed_input_ids(input_ids)
-        hidden_states = embeds
+        if hidden_states is None:
+            hidden_states = embeds
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, embeds, hidden_states, residual)
@@ -230,6 +232,10 @@ class LlamaEagle3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        eagle_config = getattr(config, "eagle_config", None)
+        self.use_aux_hidden_state = True
+        if isinstance(eagle_config, dict):
+            self.use_aux_hidden_state = bool(eagle_config.get("use_aux_hidden_state", True))
         self.model = LlamaEagle3Model(config)
         # Draft vocab size may differ from target vocab size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
@@ -248,15 +254,25 @@ class LlamaEagle3ForCausalLM(nn.Module):
             bias=False,
         )
         
-        # Optional: vocab mapping tensor for draft->target vocab (loaded from config or file)
+        # Optional: draft->target mapping used to turn draft head outputs into target token ids.
+        self.register_buffer("d2t", torch.empty(0, dtype=torch.int64), persistent=False)
+        # Optional: target->draft mapping is loaded for debugging but not consumed in the
+        # forward_with_hidden path where inputs stay in target token space.
+        self.register_buffer("t2d", torch.empty(0, dtype=torch.int64), persistent=False)
         self.vocab_mapping: torch.Tensor | None = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, hidden_states=hidden_states)
+
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_aux_hidden_state and hidden_states.size(-1) == self.fc.weight.size(1):
+            return self.fc(hidden_states)
+        return hidden_states
     
     def forward_with_hidden(
         self,
@@ -273,24 +289,19 @@ class LlamaEagle3ForCausalLM(nn.Module):
             prev_hidden_states: [N, H] hidden states from previous step (None for first step)
         
         Returns:
-            hidden_states: [N, H] output hidden states
-            fused_hidden: [N, H] fused hidden states (for passing to next step)
+        hidden_states: [N, H] output hidden states
+        fused_hidden: [N, H] fused hidden states (for passing to next step)
         """
         embeds = self.model.embed_input_ids(input_ids)
-        hidden_states = embeds
-        
-        if prev_hidden_states is not None:
-            # Fuse previous hidden, current hidden (embeds initially), and embed
-            # using the fc layer: [prev_hidden, curr_hidden, embed] -> fused
-            fused_input = torch.cat([prev_hidden_states, hidden_states, embeds], dim=-1)
-            hidden_states = self.fc(fused_input)
-        
+        if prev_hidden_states is None:
+            hidden_states = embeds
+        else:
+            hidden_states = self.combine_hidden_states(prev_hidden_states)
         residual = None
         for layer in self.model.layers:
             hidden_states, residual = layer(positions, embeds, hidden_states, residual)
-        hidden_states, _ = self.model.norm(hidden_states, residual)
-        
-        return hidden_states, hidden_states  # Return hidden_states as both output and state for next step
+        hidden_states, hidden_prenorm = self.model.norm(hidden_states, residual)
+        return hidden_states, hidden_prenorm
 
     def compute_logits(
         self,
@@ -321,14 +332,15 @@ class LlamaEagle3ForCausalLM(nn.Module):
         # If draft and target vocab are the same, no mapping needed
         if self.draft_vocab_size == self.target_vocab_size and self.vocab_mapping is None:
             return draft_logits
-        
-        # Map draft logits to target vocab space
-        target_logits = compute_logits_with_mapping(
-            draft_logits,
-            self.draft_vocab_size,
-            self.target_vocab_size,
-            self.vocab_mapping,
+        target_logits = torch.full(
+            (draft_logits.size(0), self.target_vocab_size),
+            float("-inf"),
+            device=draft_logits.device,
+            dtype=draft_logits.dtype,
         )
+        target_ids = self.get_draft_target_ids(draft_logits.device)
+        valid = (target_ids >= 0) & (target_ids < self.target_vocab_size)
+        target_logits[:, target_ids[valid]] = draft_logits[:, valid]
         return target_logits
     
     def set_vocab_mapping(self, mapping: torch.Tensor):
@@ -339,4 +351,25 @@ class LlamaEagle3ForCausalLM(nn.Module):
             mapping: [draft_vocab] tensor where mapping[i] = target token id for draft token i
                      Use -1 to indicate no mapping exists.
         """
+        mapping = mapping.long()
+        self.d2t = mapping
         self.vocab_mapping = mapping
+
+    def set_target_to_draft_mapping(self, mapping: torch.Tensor):
+        self.t2d = mapping.long()
+
+    def tie_input_embeddings(self, weight: nn.Parameter):
+        # Eagle3 consumes target token ids on input, so it should share the target model's
+        # embedding table instead of relying on randomly initialized draft embeddings.
+        self.model.embed_tokens.weight = weight
+
+    def get_draft_target_ids(self, device: torch.device | None = None) -> torch.Tensor:
+        if self.d2t.numel() == 0:
+            return torch.arange(self.draft_vocab_size, device=device, dtype=torch.int64)
+        offsets = self.d2t.to(device=device)
+        base = torch.arange(offsets.numel(), device=offsets.device, dtype=torch.int64)
+        return base + offsets
+
+    def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        target_ids = self.get_draft_target_ids(draft_token_ids.device)
+        return target_ids[draft_token_ids]

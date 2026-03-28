@@ -1,4 +1,6 @@
+import os
 import pickle
+from time import perf_counter
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -24,6 +26,22 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self._exited = False
+        self.spec_debug = (
+            config.draft_model is not None
+            and rank == 0
+            and os.getenv("NANOVLLM_SPEC_DEBUG", "").lower() not in ("", "0", "false")
+        )
+        self.spec_stats = dict(
+            spec_calls=0,
+            proposed_tokens=0,
+            accepted_tokens=0,
+            accepted_draft_tokens=0,
+            seed_time=0.0,
+            draft_time=0.0,
+            verify_time=0.0,
+            accept_time=0.0,
+        )
+        self.eagle_aux_hidden_state_layer_ids: list[int] | None = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -37,6 +55,13 @@ class ModelRunner:
         if config.draft_hf_config is not None:
             self.draft_model = self._build_model(config.draft_hf_config)
             load_model(self.draft_model, config.draft_model)
+            if hasattr(self.draft_model, "tie_input_embeddings"):
+                self.draft_model.tie_input_embeddings(self.model.model.embed_tokens.weight)
+            if hasattr(self.model, "get_eagle3_aux_hidden_state_layers"):
+                self.eagle_aux_hidden_state_layer_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
+            else:
+                num_layers = config.hf_config.num_hidden_layers
+                self.eagle_aux_hidden_state_layer_ids = [1, num_layers // 2, num_layers - 4]
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache(self.model, hf_config)
@@ -62,6 +87,7 @@ class ModelRunner:
         if self._exited:
             return
         self._exited = True
+        self._log_spec_stats()
         if self.world_size > 1:
             try:
                 self.shm.close()
@@ -99,6 +125,35 @@ class ModelRunner:
         if arch == "LlamaForCausalLMEagle3" or model_type == "llama":
             return LlamaEagle3ForCausalLM(hf_config)
         return Qwen3ForCausalLM(hf_config)
+
+    def _spec_sync(self):
+        if self.spec_debug:
+            torch.cuda.synchronize()
+
+    def _log_spec_stats(self):
+        if not self.spec_debug:
+            return
+        stats = self.spec_stats
+        if stats["spec_calls"] == 0:
+            return
+        draft_acceptance = (
+            stats["accepted_draft_tokens"] / stats["proposed_tokens"]
+            if stats["proposed_tokens"] > 0 else 0.0
+        )
+        avg_tokens = stats["accepted_tokens"] / stats["spec_calls"]
+        avg_draft = stats["accepted_draft_tokens"] / stats["spec_calls"]
+        avg_seed_time = stats["seed_time"] / stats["spec_calls"]
+        avg_draft_time = stats["draft_time"] / stats["spec_calls"]
+        avg_verify_time = stats["verify_time"] / stats["spec_calls"]
+        avg_accept_time = stats["accept_time"] / stats["spec_calls"]
+        print(
+            "[spec_debug] "
+            f"calls={stats['spec_calls']} proposed={stats['proposed_tokens']} "
+            f"accepted_draft={stats['accepted_draft_tokens']} accepted_total={stats['accepted_tokens']} "
+            f"draft_acceptance={draft_acceptance:.6f} avg_tokens_per_call={avg_tokens:.3f} "
+            f"avg_draft_per_call={avg_draft:.3f} avg_time_ms="
+            f"(seed={avg_seed_time * 1000:.2f}, draft={avg_draft_time * 1000:.2f}, verify={avg_verify_time * 1000:.2f}, accept={avg_accept_time * 1000:.2f})"
+        )
 
     # Worker-side loop for ranks > 0: wait for commands and execute them.
     def loop(self):
@@ -242,27 +297,8 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
-    # Prepare decode inputs for a virtual step within a speculative draft cycle.
-    def prepare_decode_step(self, seqs: list[Sequence], input_token_ids: torch.Tensor, step_offset: int):
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            pos = (len(seq) - 1) + step_offset
-            positions.append(pos)
-            context_lens.append(len(seq) + step_offset)
-            block_idx = pos // self.block_size
-            slot_in_block = pos % self.block_size
-            slot_mapping.append(seq.block_table[block_idx] * self.block_size + slot_in_block)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_token_ids, positions
-
-    # Prepare a single prefill call that verifies pending + draft tokens (k+1 queries each).
-    def prepare_spec_verify(self, seqs: list[Sequence], draft_tokens: torch.Tensor, k: int):
+    # Prepare a single prefill call that verifies pending + draft tokens.
+    def prepare_spec_verify(self, seqs: list[Sequence], draft_tokens: torch.Tensor, k_list: list[int]):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -272,21 +308,18 @@ class ModelRunner:
         slot_mapping = []
         for b, seq in enumerate(seqs):
             base_pos = len(seq) - 1
-            q_len = k + 1
-            k_len = len(seq) + k
+            q_len = k_list[b] + 1
+            k_len = len(seq) + k_list[b]
             cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
             cu_seqlens_k.append(cu_seqlens_k[-1] + k_len)
             max_seqlen_q = max(max_seqlen_q, q_len)
             max_seqlen_k = max(max_seqlen_k, k_len)
-            # j=0 pending token, j>=1 draft token j-1
-            for j in range(q_len):
-                pos = base_pos + j
-                token = seq.last_token if j == 0 else draft_tokens[b, j - 1].item()
-                input_ids.append(token)
-                positions.append(pos)
-                block_idx = pos // self.block_size
-                slot_in_block = pos % self.block_size
-                slot_mapping.append(seq.block_table[block_idx] * self.block_size + slot_in_block)
+            input_ids.append(seq.last_token)
+            if q_len > 1:
+                input_ids.extend(draft_tokens[b, : q_len - 1].tolist())
+            positions.extend(range(base_pos, base_pos + q_len))
+            base_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            slot_mapping.extend(range(base_slot, base_slot + q_len))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -304,7 +337,7 @@ class ModelRunner:
             block_tables,
             prefill_last_only=False,
         )
-        return input_ids, positions
+        return input_ids, positions, cu_seqlens_q
 
     # Assemble temperatures tensor on rank 0 for sampling.
     def prepare_sample(self, seqs: list[Sequence]):
@@ -315,60 +348,180 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    # Execute the model; optionally reuse captured CUDA graphs for small decode batches.
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            # For small decode batches we can reuse captured CUDA graphs to skip kernel launch overhead.
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self.model(input_ids, positions)
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        # For small decode batches we can reuse captured CUDA graphs to skip kernel launch overhead.
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return graph_vars["outputs"][:bs]
 
     @torch.inference_mode()
-    def run_draft_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        assert self.draft_model is not None
-        # Draft path uses eager for simplicity; decode batches are small in speculative flow.
-        return self.draft_model.compute_logits(self.draft_model(input_ids, positions))
+    # Execute the model; optionally reuse captured CUDA graphs for small decode batches.
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        hidden_states = self.run_model_hidden(input_ids, positions, is_prefill)
+        return self.model.compute_logits(hidden_states)
 
-    # Draft propose pass: generate k draft tokens (one token per micro-step).
+    @torch.inference_mode()
+    def run_draft_seed_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        use_aux_hidden = bool(getattr(self.draft_model, "use_aux_hidden_state", False))
+        if use_aux_hidden:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                return_aux_hidden_states=True,
+                aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+            )
+            return aux_hidden_states if aux_hidden_states.numel() else hidden_states
+        return self.run_model_hidden(input_ids, positions, is_prefill=False)
+
+    @torch.inference_mode()
+    def prefill_draft_cache(self, seqs: list[Sequence]):
+        if self.draft_model is None:
+            return
+        input_ids = []
+        positions = []
+        cu_seqlens = [0]
+        max_seqlen = 0
+        slot_mapping = []
+        for seq in seqs:
+            if not seq.block_table:
+                continue
+            seqlen = len(seq)
+            input_ids.extend(seq.token_ids)
+            positions.extend(range(seqlen))
+            cu_seqlens.append(cu_seqlens[-1] + seqlen)
+            max_seqlen = max(max_seqlen, seqlen)
+            for block_idx, block_id in enumerate(seq.block_table):
+                start = block_id * self.block_size
+                if block_idx != len(seq.block_table) - 1:
+                    end = start + self.block_size
+                else:
+                    end = start + seq.last_block_num_tokens
+                slot_mapping.extend(range(start, end))
+        if not input_ids:
+            return
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        draft_hidden = None
+        if bool(getattr(self.draft_model, "use_aux_hidden_state", False)):
+            set_context(
+                True,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                slot_mapping,
+                None,
+                None,
+            )
+            _, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                return_aux_hidden_states=True,
+                aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+            )
+            reset_context()
+            if aux_hidden_states.numel():
+                draft_hidden = self.draft_model.combine_hidden_states(aux_hidden_states)
+        set_context(
+            True,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            slot_mapping,
+            None,
+            None,
+        )
+        _ = self.draft_model(input_ids, positions, hidden_states=draft_hidden)
+        reset_context()
+
+    @torch.inference_mode()
+    def fill_draft_cache_from_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_hidden: torch.Tensor,
+    ) -> None:
+        if self.draft_model is None:
+            return
+        _ = self.draft_model(input_ids, positions, hidden_states=draft_hidden)
+
     @torch.inference_mode()
     def propose_draft_tokens(
         self,
         seqs: list[Sequence],
-        k: int,
+        k_list: list[int],
         temperatures: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        last_target_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor]:
         assert self.draft_model is not None
         bs = len(seqs)
-        draft_tokens = torch.empty((bs, k), dtype=torch.int64, device="cuda")
-        cur_tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, device="cuda")
+        max_k = max(k_list) if k_list else 0
+        draft_tokens = torch.empty((bs, max_k), dtype=torch.int64, device="cuda")
         draft_step_logits = [] if self.rank == 0 else None
+        if max_k == 0:
+            return draft_tokens[:, :0], draft_step_logits, last_target_hidden
 
-        for step in range(k):
-            input_ids, positions = self.prepare_decode_step(seqs, cur_tokens, step)
-            logits = self.run_draft_model(input_ids, positions, is_prefill=False)
+        active_k = torch.tensor(k_list, dtype=torch.int32, device="cuda")
+        base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        base_slot = torch.tensor(
+            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        cur_tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, device="cuda")
+        cur_hidden = self.draft_model.combine_hidden_states(last_target_hidden)
+        final_hidden = cur_hidden
+
+        for step in range(max_k):
+            active = active_k > step
+            slot = torch.where(active, base_slot + step, torch.full_like(base_slot, -1))
+            context_lens = torch.where(active, base_len + step, base_len)
+            positions = base_pos + step
+            set_context(False, slot_mapping=slot, context_lens=context_lens, block_tables=block_tables)
+            hidden_out, next_hidden = self.draft_model.forward_with_hidden(cur_tokens, positions, cur_hidden)
+            logits = self.draft_model.compute_logits(hidden_out)
             if self.rank == 0:
                 draft_step_logits.append(logits)
-                next_tok = self.sampler(logits, temperatures)
+                next_draft_tokens = self.sampler(logits, temperatures)
+                next_target_tokens = self.draft_model.map_draft_to_target(next_draft_tokens)
+                next_target_tokens = torch.where(active, next_target_tokens, cur_tokens)
             else:
-                next_tok = torch.empty((bs,), dtype=torch.int64, device="cuda")
+                next_target_tokens = torch.empty((bs,), dtype=torch.int64, device="cuda")
             if self.world_size > 1:
-                dist.broadcast(next_tok, src=0)
-            draft_tokens[:, step] = next_tok
-            cur_tokens = next_tok
-        reset_context()
-        return draft_tokens, draft_step_logits
+                dist.broadcast(next_target_tokens, src=0)
+            draft_tokens[:, step] = next_target_tokens
+            cur_tokens = next_target_tokens
+            cur_hidden = torch.where(active[:, None], next_hidden, cur_hidden)
+            final_hidden = torch.where(active[:, None], next_hidden, final_hidden)
+            reset_context()
+        return draft_tokens, draft_step_logits, final_hidden
+
+    def _sample_from_probs(self, probs: torch.Tensor) -> int:
+        token = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+        return int(token.item())
+
+    def _sample_residual(self, p_probs: torch.Tensor, q_probs: torch.Tensor) -> int:
+        residual = (p_probs - q_probs).clamp_min_(0)
+        if residual.sum() <= 0:
+            residual = p_probs
+        return self._sample_from_probs(residual)
 
     # Accept/reject draft tokens using target logits (exact speculative decoding).
     @torch.inference_mode()
@@ -379,79 +532,193 @@ class ModelRunner:
         draft_step_logits: list[torch.Tensor],
         target_logits: torch.Tensor,
         temperatures: torch.Tensor,
-    ) -> list[list[int]]:
-        bs, k = draft_tokens.shape
-        target_logits = target_logits.view(bs, k + 1, -1)
-        scaled_target = target_logits.float() / temperatures[:, None, None]
-        log_probs_p = torch.log_softmax(scaled_target, dim=-1)
-        log_probs_q = [torch.log_softmax(step_logits.float() / temperatures[:, None], dim=-1) for step_logits in draft_step_logits]
+        k_list: list[int],
+        cu_q: torch.Tensor,
+    ) -> tuple[list[list[int]], torch.Tensor]:
+        bs = len(seqs)
+        target_vocab_size = target_logits.size(-1)
+        target_ids = self.draft_model.get_draft_target_ids(target_logits.device)
+        valid_target_ids = (target_ids >= 0) & (target_ids < target_vocab_size)
+        q_target_probs_steps = []
+        for step_logits in draft_step_logits:
+            q_probs = torch.softmax(step_logits.float() / temperatures[:, None], dim=-1)
+            q_target_probs = torch.zeros((bs, target_vocab_size), device=q_probs.device, dtype=q_probs.dtype)
+            indices = target_ids[valid_target_ids].unsqueeze(0).expand(bs, -1)
+            q_target_probs.scatter_add_(1, indices, q_probs[:, valid_target_ids])
+            q_target_probs_steps.append(q_target_probs)
 
+        accept_lens = torch.zeros(bs, dtype=torch.int32, device=target_logits.device)
         out_tokens_per_seq: list[list[int]] = []
         for b in range(bs):
             accepted_tokens: list[int] = []
-            reject_step = None
-            for step in range(k):
+            q_len = k_list[b] + 1
+            start = int(cu_q[b].item())
+            end = int(cu_q[b + 1].item())
+            seq_logits = target_logits[start:end]
+            temp = float(temperatures[b].item())
+            rejected = False
+            for step in range(k_list[b]):
                 y = draft_tokens[b, step]
-                lp = log_probs_p[b, step, y]
-                lq = log_probs_q[step][b, y]
-                a = torch.exp(lp - lq).clamp(max=1.0)
-                if torch.rand((), device=lp.device) <= a:
+                p_probs = torch.softmax(seq_logits[step].float() / temp, dim=-1)
+                q_probs = q_target_probs_steps[step][b]
+                q_y = q_probs[y].clamp_min_(1e-20)
+                a = torch.minimum(torch.tensor(1.0, device=p_probs.device), p_probs[y] / q_y)
+                if torch.rand((), device=p_probs.device) <= a:
                     accepted_tokens.append(int(y.item()))
+                    accept_lens[b] += 1
                 else:
-                    reject_step = step
+                    z = self._sample_residual(p_probs, q_probs)
+                    accepted_tokens.append(z)
+                    rejected = True
                     break
+            if not rejected:
+                extra_probs = torch.softmax(seq_logits[q_len - 1].float() / temp, dim=-1)
+                accepted_tokens.append(self._sample_from_probs(extra_probs))
+            out_tokens_per_seq.append(accepted_tokens)
+        return out_tokens_per_seq, accept_lens
 
-            if reject_step is not None:
-                logits_p_step = log_probs_p[b, reject_step]
-                logits_q_step = log_probs_q[reject_step][b]
-                dist_p = torch.distributions.Categorical(logits=logits_p_step)
-                while True:
-                    x = dist_p.sample()
-                    if x >= logits_q_step.numel():
-                        z = int(x.item())
-                        break
-                    lp_x = logits_p_step[x]
-                    lq_x = logits_q_step[x]
-                    alpha = torch.clamp(1 - torch.exp(lq_x - lp_x), min=0.0, max=1.0)
-                    if torch.rand((), device=alpha.device) <= alpha:
-                        z = int(x.item())
-                        break
-                out_tokens = accepted_tokens + [z]
-            else:
-                dist_p = torch.distributions.Categorical(logits=log_probs_p[b, k])
-                z = int(dist_p.sample().item())
-                out_tokens = accepted_tokens + [z]
-            out_tokens_per_seq.append(out_tokens)
-        return out_tokens_per_seq
+    @torch.inference_mode()
+    def finalize_draft_cache(
+        self,
+        seqs: list[Sequence],
+        draft_tokens: torch.Tensor,
+        final_hidden: torch.Tensor,
+        accept_lens: torch.Tensor,
+        k_list: list[int],
+    ) -> None:
+        if self.draft_model is None or draft_tokens.numel() == 0:
+            return
+        fin_mask = torch.tensor(
+            [(int(accept_lens[i].item()) == k_list[i]) and (k_list[i] > 0) for i in range(len(seqs))],
+            dtype=torch.bool,
+            device="cuda",
+        )
+        if not fin_mask.any():
+            return
+        block_tables = self.prepare_block_tables(seqs)
+        base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        base_slot = torch.tensor(
+            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        k_tensor = torch.tensor(k_list, dtype=torch.int64, device="cuda")
+        last_draft_tokens = torch.tensor(
+            [int(draft_tokens[i, k_list[i] - 1].item()) if k_list[i] > 0 else 0 for i in range(len(seqs))],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        slot = torch.where(fin_mask, base_slot + k_tensor.to(torch.int32), torch.full_like(base_slot, -1))
+        context_lens = torch.where(fin_mask, base_len + k_tensor.to(torch.int32), base_len)
+        positions = base_pos + k_tensor
+        set_context(False, slot_mapping=slot, context_lens=context_lens, block_tables=block_tables)
+        _ = self.draft_model.forward_with_hidden(last_draft_tokens, positions, final_hidden)
+        reset_context()
 
     # End-to-end run: prepare inputs, run model, sample tokens (on rank 0), and reset context.
+    @torch.inference_mode()
     def run_baseline(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-
-        if self.draft_model is not None and is_prefill:
-            _ = self.run_draft_model(input_ids, positions, is_prefill)
-
-        logits = self.run_model(input_ids, positions, is_prefill)
+        fused_prefill = False
+        if is_prefill and self.draft_model is not None and all(seq.num_cached_tokens == 0 for seq in seqs):
+            if bool(getattr(self.draft_model, "use_aux_hidden_state", False)):
+                hidden_states, aux_hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    return_aux_hidden_states=True,
+                    aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+                )
+                draft_hidden = aux_hidden_states if aux_hidden_states.numel() else hidden_states
+                draft_hidden = self.draft_model.combine_hidden_states(draft_hidden)
+            else:
+                hidden_states = self.model(input_ids, positions)
+                draft_hidden = hidden_states
+            logits = self.model.compute_logits(hidden_states)
+            self.fill_draft_cache_from_prefill(input_ids, positions, draft_hidden)
+            fused_prefill = True
+        else:
+            logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
+        if self.draft_model is not None and is_prefill and not fused_prefill:
+            self.prefill_draft_cache(seqs)
         if token_ids is None:
             return None
         return [[t] for t in token_ids]
 
+    @torch.inference_mode()
     def run_spec_decode(self, seqs: list[Sequence]) -> list[list[int]] | None:
         assert self.draft_model is not None
-        k = getattr(self.config, "num_spec_tokens", 0)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        k_list = []
+        for seq in seqs:
+            remaining = seq.max_tokens - seq.num_completion_tokens
+            k = min(getattr(self.config, "num_spec_tokens", 0), max(0, remaining - 1))
+            k = min(k, self.block_size - seq.last_block_num_tokens)
+            k_list.append(k)
 
-        draft_tokens, draft_step_logits = self.propose_draft_tokens(seqs, k, temperatures)
-        input_ids, positions = self.prepare_spec_verify(seqs, draft_tokens, k)
+        input_ids, positions = self.prepare_decode(seqs)
+        if self.spec_debug:
+            self._spec_sync()
+            t0 = perf_counter()
+        last_target_hidden = self.run_draft_seed_hidden(input_ids, positions)
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["seed_time"] += perf_counter() - t0
+        reset_context()
+
+        if self.spec_debug:
+            self.spec_stats["spec_calls"] += 1
+            self._spec_sync()
+            t0 = perf_counter()
+        draft_tokens, draft_step_logits, final_hidden = self.propose_draft_tokens(
+            seqs,
+            k_list,
+            temperatures,
+            last_target_hidden,
+        )
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["draft_time"] += perf_counter() - t0
+            self.spec_stats["proposed_tokens"] += sum(k_list)
+        input_ids, positions, cu_q = self.prepare_spec_verify(seqs, draft_tokens, k_list)
+        if self.spec_debug:
+            self._spec_sync()
+            t0 = perf_counter()
         target_logits = self.run_model(input_ids, positions, is_prefill=True)
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["verify_time"] += perf_counter() - t0
         reset_context()
 
         if self.rank != 0:
+            accept_lens = torch.empty(len(seqs), dtype=torch.int32, device="cuda")
+            if self.world_size > 1:
+                dist.broadcast(accept_lens, src=0)
+            self.finalize_draft_cache(seqs, draft_tokens, final_hidden, accept_lens, k_list)
             return None
-        token_ids = self.accept_draft_tokens(seqs, draft_tokens, draft_step_logits, target_logits, temperatures)
+        if self.spec_debug:
+            self._spec_sync()
+            t0 = perf_counter()
+        token_ids, accept_lens = self.accept_draft_tokens(
+            seqs,
+            draft_tokens,
+            draft_step_logits,
+            target_logits,
+            temperatures,
+            k_list,
+            cu_q,
+        )
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["accept_time"] += perf_counter() - t0
+            self.spec_stats["accepted_tokens"] += sum(len(toks) for toks in token_ids)
+            self.spec_stats["accepted_draft_tokens"] += sum(max(len(toks) - 1, 0) for toks in token_ids)
+        if self.world_size > 1:
+            dist.broadcast(accept_lens, src=0)
+        self.finalize_draft_cache(seqs, draft_tokens, final_hidden, accept_lens, k_list)
         return token_ids
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
