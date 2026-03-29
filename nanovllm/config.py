@@ -21,6 +21,7 @@ class Config:
     num_kvcache_blocks: int = -1
     # Single-step speculative tokens; keep 1 for MVP.
     num_spec_tokens: int = 5
+    speculative_token_tree: str | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

@@ -13,6 +13,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    tree_attn_bias: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -28,6 +29,7 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
+    tree_attn_bias=None,
     prefill_last_only: bool = True,
 ):
     global _CONTEXT
@@ -41,6 +43,7 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
+        tree_attn_bias,
     )
 
 def reset_context():

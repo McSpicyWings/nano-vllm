@@ -1,0 +1,50 @@
+{
+  "config": {
+    "target_model": "./huggingface/Qwen3-1.7B",
+    "draft_model": "./huggingface/AngelSlim/Qwen3-1.7B_eagle3",
+    "num_prompts": 16,
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "seed": 0,
+    "num_spec_tokens": 3,
+    "enable_chunked_prefill": true,
+    "enforce_eager": false
+  },
+  "baseline": {
+    "case_name": "baseline",
+    "elapsed_s": 1.342974312021397,
+    "total_prompt_tokens": 233,
+    "total_output_tokens": 2048,
+    "overall_tokens_per_s": 1698.4688237012665,
+    "output_tokens_per_s": 1524.9733235160868,
+    "num_drafts": 0.0,
+    "num_draft_tokens": 0.0,
+    "num_accepted_tokens": 0.0,
+    "mean_acceptance_length": null,
+    "draft_acceptance_rate": null,
+    "acceptance_per_pos": null,
+    "error": null
+  },
+  "eagle3_spec": {
+    "case_name": "eagle3_spec",
+    "elapsed_s": 1.677443700027652,
+    "total_prompt_tokens": 233,
+    "total_output_tokens": 2048,
+    "overall_tokens_per_s": 1359.8071875451906,
+    "output_tokens_per_s": 1220.9053573400045,
+    "num_drafts": 1303.0,
+    "num_draft_tokens": 3909.0,
+    "num_accepted_tokens": 736.0,
+    "mean_acceptance_length": 1.5648503453568687,
+    "draft_acceptance_rate": 0.1882834484522896,
+    "acceptance_per_pos": [
+      0.37145049884881043,
+      0.13277052954719878,
+      0.060629316960859554
+    ],
+    "error": null
+  },
+  "speedup_vs_baseline": 0.8006076817953762
+}

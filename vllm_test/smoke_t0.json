@@ -1,0 +1,46 @@
+{
+  "config": {
+    "target_model": "./huggingface/Qwen3-1.7B",
+    "draft_model": "./huggingface/AngelSlim/Qwen3-1.7B_eagle3",
+    "num_prompts": 2,
+    "max_tokens": 16,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "seed": 0,
+    "num_spec_tokens": 3,
+    "enable_chunked_prefill": true,
+    "enforce_eager": false
+  },
+  "baseline": {
+    "case_name": "baseline",
+    "elapsed_s": 0.16728059097658843,
+    "total_prompt_tokens": 29,
+    "total_output_tokens": 32,
+    "overall_tokens_per_s": 364.6567700644792,
+    "output_tokens_per_s": 191.29535478792351,
+    "num_drafts": 0.0,
+    "num_draft_tokens": 0.0,
+    "num_accepted_tokens": 0.0,
+    "mean_acceptance_length": null,
+    "draft_acceptance_rate": null,
+    "acceptance_per_pos": null,
+    "error": null
+  },
+  "eagle3_spec": {
+    "case_name": "eagle3_spec",
+    "elapsed_s": 0.0,
+    "total_prompt_tokens": 0,
+    "total_output_tokens": 0,
+    "overall_tokens_per_s": 0.0,
+    "output_tokens_per_s": 0.0,
+    "num_drafts": 0.0,
+    "num_draft_tokens": 0.0,
+    "num_accepted_tokens": 0.0,
+    "mean_acceptance_length": null,
+    "draft_acceptance_rate": null,
+    "acceptance_per_pos": null,
+    "error": "Traceback (most recent call last):\n  File \"/home/wpc/nano-vllm/vllm_test/bench_vllm_eagle3.py\", line 196, in _run_case_worker\n    llm = LLM(\n          ^^^^\n  File \"/home/wpc/project/vllm/vllm/entrypoints/llm.py\", line 351, in __init__\n    self.llm_engine = LLMEngine.from_engine_args(\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wpc/project/vllm/vllm/v1/engine/llm_engine.py\", line 183, in from_engine_args\n    return cls(\n           ^^^^\n  File \"/home/wpc/project/vllm/vllm/v1/engine/llm_engine.py\", line 109, in __init__\n    self.engine_core = EngineCoreClient.make_client(\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wpc/project/vllm/vllm/v1/engine/core_client.py\", line 93, in make_client\n    return SyncMPClient(vllm_config, executor_class, log_stats)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wpc/project/vllm/vllm/v1/engine/core_client.py\", line 648, in __init__\n    super().__init__(\n  File \"/home/wpc/project/vllm/vllm/v1/engine/core_client.py\", line 477, in __init__\n    with launch_core_engines(vllm_config, executor_class, log_stats) as (\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/wpc/.local/opt/miniforge3/envs/vllm/lib/python3.12/contextlib.py\", line 144, in __exit__\n    next(self.gen)\n  File \"/home/wpc/project/vllm/vllm/v1/engine/utils.py\", line 903, in launch_core_engines\n    wait_for_engine_startup(\n  File \"/home/wpc/project/vllm/vllm/v1/engine/utils.py\", line 960, in wait_for_engine_startup\n    raise RuntimeError(\nRuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}\n"
+  },
+  "speedup_vs_baseline": null
+}

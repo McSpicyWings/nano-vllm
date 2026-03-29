@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
+import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -247,3 +248,13 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def compute_logits_subset(
+        self,
+        hidden_states: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.lm_head.tp_size > 1:
+            return self.compute_logits(hidden_states).index_select(1, token_ids)
+        weight = self.lm_head.weight.index_select(0, token_ids.to(self.lm_head.weight.device))
+        return F.linear(hidden_states, weight)
