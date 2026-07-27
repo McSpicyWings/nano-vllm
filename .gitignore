@@ -172,6 +172,10 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# Local smoke output is disposable; formal benchmark artifacts are tracked.
+benchmarks/results/smoke/
+!benchmarks/legacy/bench.log
+
 # Abstra
 # Abstra is an AI-powered process automation framework.
 # Ignore directories containing user credentials, local state, and settings.

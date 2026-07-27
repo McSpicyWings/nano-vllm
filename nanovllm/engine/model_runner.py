@@ -38,9 +38,10 @@ class ModelRunner:
         )
         self.spec_stats = dict(
             spec_calls=0,
+            sequence_proposals=0,
             proposed_tokens=0,
-            accepted_tokens=0,
             accepted_draft_tokens=0,
+            emitted_tokens=0,
             seed_time=0.0,
             draft_time=0.0,
             verify_time=0.0,
@@ -48,8 +49,6 @@ class ModelRunner:
         )
         self.eagle_aux_hidden_state_layer_ids: list[int] | None = None
         self.seq_prev_hidden: dict[int, torch.Tensor] = {}
-        self.spec_target_token_ids: torch.Tensor | None = None
-        self.spec_target_lm_head_weight: torch.Tensor | None = None
         self.spec_token_tree = self._build_spec_token_tree()
         self.spec_tree_leaf_paths = self._get_tree_leaf_paths(self.spec_token_tree)
         self.spec_tree_nodes_by_level = self._get_tree_nodes_by_level(self.spec_token_tree)
@@ -77,15 +76,10 @@ class ModelRunner:
             else:
                 num_layers = config.hf_config.num_hidden_layers
                 self.eagle_aux_hidden_state_layer_ids = [1, num_layers // 2, num_layers - 4]
-            if hasattr(self.model, "compute_logits_subset") and hasattr(self.draft_model, "get_draft_target_ids"):
-                self.spec_target_token_ids = self.draft_model.get_draft_target_ids(torch.device("cuda"))
-                if getattr(self.model.lm_head, "tp_size", 1) == 1:
-                    self.spec_target_lm_head_weight = self.model.lm_head.weight.index_select(
-                        0,
-                        self.spec_target_token_ids,
-                    ).contiguous()
         self.sampler = Sampler()
         self.warmup_model()
+        # Warmup sequences are synthetic and never pass through Scheduler cleanup.
+        self.seq_prev_hidden.clear()
         self.allocate_kv_cache(self.model, hf_config)
         if self.draft_model is not None:
             self.allocate_kv_cache(self.draft_model, config.draft_hf_config)
@@ -152,8 +146,32 @@ class ModelRunner:
         tree_str = getattr(self.config, "speculative_token_tree", None)
         if tree_str is None:
             return [(i + 1) * (0,) for i in range(max(getattr(self.config, "num_spec_tokens", 0), 0))]
-        tree_choices = ast.literal_eval(tree_str)
-        return sorted(tree_choices, key=lambda t: (len(t), t))
+        tree_choices = ast.literal_eval(tree_str) if isinstance(tree_str, str) else tree_str
+        try:
+            paths = [tuple(int(choice) for choice in path) for path in tree_choices]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("speculative_token_tree must be a sequence of integer paths") from exc
+        if not paths or any(not path for path in paths):
+            raise ValueError("speculative_token_tree must contain non-empty paths")
+        if any(choice < 0 for path in paths for choice in path):
+            raise ValueError("speculative_token_tree choices must be non-negative")
+        if len(set(paths)) != len(paths):
+            raise ValueError("speculative_token_tree paths must be unique")
+        path_set = set(paths)
+        for path in paths:
+            for depth in range(1, len(path)):
+                if path[:depth] not in path_set:
+                    raise ValueError(f"missing tree prefix {path[:depth]} for path {path}")
+        leaves = [
+            path for path in paths
+            if not any(len(other) > len(path) and other[:len(path)] == path for other in paths)
+        ]
+        if len({len(path) for path in leaves}) != 1:
+            raise ValueError("all speculative_token_tree leaves must have the same depth")
+        max_depth = max(len(path) for path in paths)
+        if max_depth > getattr(self.config, "num_spec_tokens", 0):
+            raise ValueError("speculative_token_tree depth cannot exceed num_spec_tokens")
+        return sorted(paths, key=lambda t: (len(t), t))
 
     def _get_tree_leaf_paths(self, tree_choices: list[tuple[int, ...]]) -> list[tuple[int, ...]]:
         if not tree_choices:
@@ -231,20 +249,57 @@ class ModelRunner:
             stats["accepted_draft_tokens"] / stats["proposed_tokens"]
             if stats["proposed_tokens"] > 0 else 0.0
         )
-        avg_tokens = stats["accepted_tokens"] / stats["spec_calls"]
-        avg_draft = stats["accepted_draft_tokens"] / stats["spec_calls"]
+        mean_acceptance_length = (
+            stats["emitted_tokens"] / stats["sequence_proposals"]
+            if stats["sequence_proposals"] > 0 else 0.0
+        )
+        avg_draft = (
+            stats["accepted_draft_tokens"] / stats["sequence_proposals"]
+            if stats["sequence_proposals"] > 0 else 0.0
+        )
         avg_seed_time = stats["seed_time"] / stats["spec_calls"]
         avg_draft_time = stats["draft_time"] / stats["spec_calls"]
         avg_verify_time = stats["verify_time"] / stats["spec_calls"]
         avg_accept_time = stats["accept_time"] / stats["spec_calls"]
         print(
             "[spec_debug] "
-            f"calls={stats['spec_calls']} proposed={stats['proposed_tokens']} "
-            f"accepted_draft={stats['accepted_draft_tokens']} accepted_total={stats['accepted_tokens']} "
-            f"draft_acceptance={draft_acceptance:.6f} avg_tokens_per_call={avg_tokens:.3f} "
-            f"avg_draft_per_call={avg_draft:.3f} avg_time_ms="
+            f"calls={stats['spec_calls']} sequence_proposals={stats['sequence_proposals']} "
+            f"proposed={stats['proposed_tokens']} accepted_draft={stats['accepted_draft_tokens']} "
+            f"emitted={stats['emitted_tokens']} draft_acceptance={draft_acceptance:.6f} "
+            f"mean_acceptance_length={mean_acceptance_length:.3f} "
+            f"mean_accepted_draft_length={avg_draft:.3f} avg_time_ms="
             f"(seed={avg_seed_time * 1000:.2f}, draft={avg_draft_time * 1000:.2f}, verify={avg_verify_time * 1000:.2f}, accept={avg_accept_time * 1000:.2f})"
         )
+
+    def get_spec_stats(self, reset: bool = False) -> dict:
+        stats = dict(self.spec_stats)
+        stats["timing_enabled"] = bool(getattr(self, "spec_debug", False))
+        stats["acceptance_rate"] = (
+            stats["accepted_draft_tokens"] / stats["proposed_tokens"]
+            if stats["proposed_tokens"] > 0 else 0.0
+        )
+        stats["mean_acceptance_length"] = (
+            stats["emitted_tokens"] / stats["sequence_proposals"]
+            if stats["sequence_proposals"] > 0 else 0.0
+        )
+        stats["mean_accepted_draft_length"] = (
+            stats["accepted_draft_tokens"] / stats["sequence_proposals"]
+            if stats["sequence_proposals"] > 0 else 0.0
+        )
+        if reset:
+            for key in self.spec_stats:
+                self.spec_stats[key] = 0 if key in {
+                    "spec_calls",
+                    "sequence_proposals",
+                    "proposed_tokens",
+                    "accepted_draft_tokens",
+                    "emitted_tokens",
+                } else 0.0
+        return stats
+
+    def release_sequences(self, seq_ids: list[int]) -> None:
+        for seq_id in seq_ids:
+            self.seq_prev_hidden.pop(seq_id, None)
 
     def _cache_prev_hidden(self, seqs: list[Sequence], prev_hidden: torch.Tensor) -> None:
         for i, seq in enumerate(seqs):
@@ -369,6 +424,14 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
+    def _slot_for_position(self, seq: Sequence, position: int) -> int:
+        logical_block = position // self.block_size
+        if logical_block >= len(seq.block_table):
+            raise RuntimeError(
+                f"position {position} has no reserved KV block for sequence {seq.seq_id}"
+            )
+        return seq.block_table[logical_block] * self.block_size + position % self.block_size
+
     # Flatten prompt tokens into contiguous buffers and set prefill context metadata.
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -419,7 +482,7 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(self._slot_for_position(seq, len(seq) - 1))
         # Only a single token per sequence is executed, so we just gather the tip of each block table.
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -450,8 +513,10 @@ class ModelRunner:
             if q_len > 1:
                 input_ids.extend(draft_tokens[b, : q_len - 1].tolist())
             positions.extend(range(base_pos, base_pos + q_len))
-            base_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            slot_mapping.extend(range(base_slot, base_slot + q_len))
+            slot_mapping.extend(
+                self._slot_for_position(seq, position)
+                for position in range(base_pos, base_pos + q_len)
+            )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -485,20 +550,32 @@ class ModelRunner:
         seqs: list[Sequence],
         input_token_ids: list[int],
         stage: int,
+        active_mask: list[bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if active_mask is None:
+            active_mask = [True] * len(seqs)
         input_ids = torch.tensor(input_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(
-            [len(seq) - 1 + stage for seq in seqs],
+            [
+                len(seq) - 1 + stage if active else len(seq) - 1
+                for seq, active in zip(seqs, active_mask, strict=True)
+            ],
             dtype=torch.int64,
             pin_memory=True,
         ).cuda(non_blocking=True)
         slot_mapping = torch.tensor(
-            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 + stage for seq in seqs],
+            [
+                self._slot_for_position(seq, len(seq) - 1 + stage) if active else -1
+                for seq, active in zip(seqs, active_mask, strict=True)
+            ],
             dtype=torch.int32,
             pin_memory=True,
         ).cuda(non_blocking=True)
         context_lens = torch.tensor(
-            [len(seq) + stage for seq in seqs],
+            [
+                len(seq) + stage if active else len(seq)
+                for seq, active in zip(seqs, active_mask, strict=True)
+            ],
             dtype=torch.int32,
             pin_memory=True,
         ).cuda(non_blocking=True)
@@ -513,16 +590,18 @@ class ModelRunner:
                 aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
             )
             prev_hidden = aux_hidden_states if aux_hidden_states.numel() else hidden_states
+            # Ordinary decoding uses a CUDA graph when enabled. Recompute the
+            # final hidden state through that same graph so strict greedy
+            # verification sees the identical BF16 kernel and argmax.
+            logits_hidden = (
+                hidden_states
+                if self.enforce_eager
+                else self.run_model_hidden(input_ids, positions, is_prefill=False)
+            )
         else:
-            hidden_states = self.model(input_ids, positions)
-            prev_hidden = hidden_states
-        target_token_ids = self.spec_target_token_ids
-        if self.spec_target_lm_head_weight is not None:
-            target_logits = torch.nn.functional.linear(hidden_states, self.spec_target_lm_head_weight)
-        elif target_token_ids is not None:
-            target_logits = self.model.compute_logits_subset(hidden_states, target_token_ids)
-        else:
-            target_logits = self.model.compute_logits(hidden_states)
+            logits_hidden = self.run_model_hidden(input_ids, positions, is_prefill=False)
+            prev_hidden = logits_hidden
+        target_logits = self.model.compute_logits(logits_hidden)
         reset_context()
         return target_logits, prev_hidden
 
@@ -656,11 +735,6 @@ class ModelRunner:
         active_k = torch.tensor(k_list, dtype=torch.int32, device="cuda")
         base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        base_slot = torch.tensor(
-            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         cur_tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, device="cuda")
         cur_hidden = self.draft_model.combine_hidden_states(prev_token_hidden)
@@ -668,7 +742,12 @@ class ModelRunner:
 
         for step in range(max_k):
             active = active_k > step
-            slot = torch.where(active, base_slot + step, torch.full_like(base_slot, -1))
+            step_slots = torch.tensor(
+                [self._slot_for_position(seq, len(seq) - 1 + step) for seq in seqs],
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            slot = torch.where(active, step_slots, torch.full_like(step_slots, -1))
             context_lens = torch.where(active, base_len + step, base_len)
             positions = base_pos + step
             set_context(False, slot_mapping=slot, context_lens=context_lens, block_tables=block_tables)
@@ -711,7 +790,7 @@ class ModelRunner:
         base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         base_slot = torch.tensor(
-            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
+            [self._slot_for_position(seq, len(seq) - 1) for seq in seqs],
             dtype=torch.int32,
             pin_memory=True,
         ).cuda(non_blocking=True)
@@ -945,82 +1024,86 @@ class ModelRunner:
         return out_tokens_per_seq, accept_lens, prev_indices
 
     @torch.inference_mode()
-    def run_tree_verify(
+    def run_sequential_verify(
         self,
         seqs: list[Sequence],
-        tree_tokens: torch.Tensor,
-        root_tokens: torch.Tensor,
-        root_choice_indices: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        k_list: list[int],
+        tree_tokens: torch.Tensor | None = None,
     ) -> tuple[list[list[int]], torch.Tensor, torch.Tensor, list[list[torch.Tensor]]]:
         bs = len(seqs)
-        device = tree_tokens.device
-        target_token_ids = self.spec_target_token_ids
-        out_tokens_per_seq: list[list[int]] = [[int(root_tokens[i].item())] for i in range(bs)]
+        device = draft_tokens.device
+        out_tokens_per_seq: list[list[int]] = [[] for _ in range(bs)]
         accepted_hidden_rows: list[list[torch.Tensor]] = [[] for _ in range(bs)]
-        accept_lens = torch.ones(bs, dtype=torch.int32, device=device)
+        accept_lens = torch.zeros(bs, dtype=torch.int32, device=device)
         next_prev_hidden = [None] * bs
+        active = [True] * bs
+        input_token_ids = [seq.last_token for seq in seqs]
+        matched_paths: list[tuple[int, ...] | None] = [None] * bs
+        max_k = max(k_list, default=0)
 
-        def greedy_token(logits_row: torch.Tensor) -> int:
-            greedy_idx = logits_row.argmax(dim=-1)
-            if target_token_ids is None:
-                return int(greedy_idx.item())
-            return int(target_token_ids[greedy_idx].item())
-
-        active_indices = list(range(bs))
-        active_input_tokens = root_tokens.tolist()
-        root_paths = self.spec_tree_nodes_by_level[0]
-        parent_paths = {
-            idx: root_paths[int(root_choice_indices[idx].item())]
-            for idx in active_indices
-        }
-
-        for stage in range(1, self.spec_tree_depth + 1):
-            if not active_indices:
+        # Keep every scheduler row in every target call. Besides avoiding Python
+        # batch compaction, this deliberately matches ordinary greedy decode's
+        # GEMM/CUDA-graph batch shape so near-tied BF16 logits cannot change the
+        # fallback argmax merely because speculative verification was packed.
+        for stage in range(max_k + 1):
+            stage_active = [
+                active[index] and stage <= k_list[index]
+                for index in range(bs)
+            ]
+            if not any(stage_active):
                 break
-            active_seqs = [seqs[idx] for idx in active_indices]
             target_logits, prev_hidden = self.run_target_decode_stage(
-                active_seqs,
-                active_input_tokens,
+                seqs,
+                input_token_ids,
                 stage,
+                stage_active,
             )
-            next_active_indices: list[int] = []
-            next_active_input_tokens: list[int] = []
-            next_parent_paths: dict[int, tuple[int, ...]] = {}
-
-            for row_idx, seq_idx in enumerate(active_indices):
-                prev_hidden_row = prev_hidden[row_idx].clone()
-                logits_row = target_logits[row_idx]
+            next_input_token_ids = list(input_token_ids)
+            for seq_idx in range(bs):
+                if not stage_active[seq_idx]:
+                    continue
+                prev_hidden_row = prev_hidden[seq_idx].clone()
                 accepted_hidden_rows[seq_idx].append(prev_hidden_row)
-                if stage == self.spec_tree_depth:
-                    bonus_token = greedy_token(logits_row)
-                    out_tokens_per_seq[seq_idx].append(bonus_token)
-                    next_prev_hidden[seq_idx] = prev_hidden_row
-                    continue
-
-                parent_path = parent_paths[seq_idx]
-                child_paths = self.spec_tree_children.get(parent_path, [])
-                target_greedy = greedy_token(logits_row)
-                matched_child = None
-                for child_path in child_paths:
-                    child_token = int(tree_tokens[seq_idx, self.spec_tree_path_to_index[child_path]].item())
-                    if child_token == target_greedy:
-                        matched_child = child_path
-                        break
-
+                target_greedy = int(target_logits[seq_idx].argmax(dim=-1).item())
                 out_tokens_per_seq[seq_idx].append(target_greedy)
-                if matched_child is None:
+                next_input_token_ids[seq_idx] = target_greedy
+
+                if stage == k_list[seq_idx]:
                     next_prev_hidden[seq_idx] = prev_hidden_row
+                    active[seq_idx] = False
                     continue
 
-                accept_lens[seq_idx] += 1
-                next_active_indices.append(seq_idx)
-                next_active_input_tokens.append(target_greedy)
-                next_parent_paths[seq_idx] = matched_child
+                matched_path = None
+                if tree_tokens is not None:
+                    candidate_paths = (
+                        self.spec_tree_nodes_by_level[0]
+                        if stage == 0
+                        else self.spec_tree_children.get(matched_paths[seq_idx], [])
+                    )
+                    for candidate_path in candidate_paths:
+                        candidate_token = int(
+                            tree_tokens[
+                                seq_idx,
+                                self.spec_tree_path_to_index[candidate_path],
+                            ].item()
+                        )
+                        if candidate_token == target_greedy:
+                            matched_path = candidate_path
+                            break
+                elif target_greedy == int(draft_tokens[seq_idx, stage].item()):
+                    matched_path = (stage,)
 
-            active_indices = next_active_indices
-            active_input_tokens = next_active_input_tokens
-            parent_paths = next_parent_paths
+                if matched_path is None:
+                    next_prev_hidden[seq_idx] = prev_hidden_row
+                    active[seq_idx] = False
+                else:
+                    matched_paths[seq_idx] = matched_path
+                    accept_lens[seq_idx] += 1
+            input_token_ids = next_input_token_ids
 
+        if any(hidden is None for hidden in next_prev_hidden):
+            raise RuntimeError("sequential verifier did not finalize every sequence")
         next_prev_hidden_tensor = torch.stack(next_prev_hidden, dim=0)
         return out_tokens_per_seq, accept_lens, next_prev_hidden_tensor, accepted_hidden_rows
 
@@ -1045,18 +1128,21 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        base_slot = torch.tensor(
-            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
         k_tensor = torch.tensor(k_list, dtype=torch.int64, device="cuda")
         last_draft_tokens = torch.tensor(
             [int(draft_tokens[i, k_list[i] - 1].item()) if k_list[i] > 0 else 0 for i in range(len(seqs))],
             dtype=torch.int64,
             device="cuda",
         )
-        slot = torch.where(fin_mask, base_slot + k_tensor.to(torch.int32), torch.full_like(base_slot, -1))
+        final_slots = torch.tensor(
+            [
+                self._slot_for_position(seq, len(seq) - 1 + k_list[i])
+                for i, seq in enumerate(seqs)
+            ],
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        slot = torch.where(fin_mask, final_slots, torch.full_like(final_slots, -1))
         context_lens = torch.where(fin_mask, base_len + k_tensor.to(torch.int32), base_len)
         positions = base_pos + k_tensor
         set_context(False, slot_mapping=slot, context_lens=context_lens, block_tables=block_tables)
@@ -1093,15 +1179,19 @@ class ModelRunner:
             max_q = max(max_q, q_len)
             max_k = max(max_k, k_len)
             base_pos = len(seq) - 1
-            base_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             seq_input_ids = [seq.last_token, *cache_tokens]
             input_ids.extend(seq_input_ids)
             positions.extend(range(base_pos, base_pos + q_len))
-            slot_mapping.extend(range(base_slot, base_slot + q_len))
+            slot_mapping.extend(
+                self._slot_for_position(seq, position)
+                for position in range(base_pos, base_pos + q_len)
+            )
             raw_hidden_inputs.append(prev_token_hidden[b])
             if cache_tokens:
                 if accepted_hidden_rows is not None:
-                    raw_hidden_inputs.extend(accepted_hidden_rows[b])
+                    if len(accepted_hidden_rows[b]) < len(cache_tokens):
+                        raise RuntimeError("insufficient target hidden states for draft cache replay")
+                    raw_hidden_inputs.extend(accepted_hidden_rows[b][:len(cache_tokens)])
                 elif accepted_query_indices is None:
                     start = int(cu_q[b].item())
                     raw_hidden_inputs.extend(prev_hidden_source[start : start + len(cache_tokens)])
@@ -1180,6 +1270,11 @@ class ModelRunner:
     def run_spec_decode(self, seqs: list[Sequence]) -> list[list[int]] | None:
         assert self.draft_model is not None
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if temperatures is not None and bool((temperatures > 0).any().item()):
+            raise ValueError(
+                "EAGLE-3 speculative decoding currently supports greedy sampling only "
+                "(temperature=0); rejection sampling is not implemented."
+            )
         use_tree_proposal = self._can_use_tree_batch(seqs)
         k_list = []
         for seq in seqs:
@@ -1203,109 +1298,69 @@ class ModelRunner:
                 self.spec_stats["seed_time"] += perf_counter() - t0
             reset_context()
 
+        self.spec_stats["spec_calls"] += 1
+        self.spec_stats["sequence_proposals"] += len(seqs)
         if self.spec_debug:
-            self.spec_stats["spec_calls"] += 1
             self._spec_sync()
             t0 = perf_counter()
-        draft_tokens, final_hidden, tree_tokens, tree_root_choice = self.propose_draft_tokens(
+        draft_tokens, final_hidden, tree_tokens, _tree_root_choice = self.propose_draft_tokens(
             seqs,
             k_list,
             prev_token_hidden,
         )
+        self.spec_stats["proposed_tokens"] += sum(k_list)
         if self.spec_debug:
             self._spec_sync()
             self.spec_stats["draft_time"] += perf_counter() - t0
-            self.spec_stats["proposed_tokens"] += sum(k_list)
-        if use_tree_proposal and tree_tokens is not None and tree_root_choice is not None:
-            if self.rank != 0:
-                return None
-            if self.spec_debug:
-                self._spec_sync()
-                t0 = perf_counter()
-            token_ids, accept_lens, next_prev_hidden, accepted_hidden_rows = self.run_tree_verify(
-                seqs,
-                tree_tokens,
-                draft_tokens[:, 0],
-                tree_root_choice,
-            )
-            if self.spec_debug:
-                self._spec_sync()
-                self.spec_stats["verify_time"] += perf_counter() - t0
-                self._spec_sync()
-                t1 = perf_counter()
-            self._cache_prev_hidden(seqs, next_prev_hidden)
-            self.replay_draft_cache(
-                seqs,
-                token_ids,
-                prev_token_hidden,
-                next_prev_hidden,
-                torch.zeros(len(seqs) + 1, dtype=torch.int32, device="cuda"),
-                accepted_hidden_rows=accepted_hidden_rows,
-            )
-            if self.spec_debug:
-                self._spec_sync()
-                self.spec_stats["accept_time"] += perf_counter() - t1
-                self.spec_stats["accepted_tokens"] += sum(len(toks) for toks in token_ids)
-                self.spec_stats["accepted_draft_tokens"] += sum(max(len(toks) - 1, 0) for toks in token_ids)
-            return token_ids
-
-        input_ids, positions, cu_q = self.prepare_spec_verify(seqs, draft_tokens, k_list)
         if self.spec_debug:
             self._spec_sync()
             t0 = perf_counter()
-        use_aux_hidden = bool(getattr(self.draft_model, "use_aux_hidden_state", False))
-        if use_aux_hidden:
-            hidden_states, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                return_aux_hidden_states=True,
-                aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+        token_ids, accept_lens, next_prev_hidden, accepted_hidden_rows = (
+            self.run_sequential_verify(
+                seqs,
+                draft_tokens,
+                k_list,
+                tree_tokens if use_tree_proposal else None,
             )
-            prev_hidden_source = aux_hidden_states if aux_hidden_states.numel() else hidden_states
-        else:
-            hidden_states = self.model(input_ids, positions)
-            prev_hidden_source = hidden_states
-        target_token_ids = self.spec_target_token_ids
-        if self.spec_target_lm_head_weight is not None:
-            target_logits = torch.nn.functional.linear(hidden_states, self.spec_target_lm_head_weight)
-        elif target_token_ids is not None:
-            target_logits = self.model.compute_logits_subset(hidden_states, target_token_ids)
-        else:
-            target_logits = self.model.compute_logits(hidden_states)
+        )
         if self.spec_debug:
             self._spec_sync()
             self.spec_stats["verify_time"] += perf_counter() - t0
-        reset_context()
 
         if self.rank != 0:
-            accept_lens = torch.empty(len(seqs), dtype=torch.int32, device="cuda")
             if self.world_size > 1:
                 dist.broadcast(accept_lens, src=0)
-            self._cache_prev_hidden_from_verify(seqs, prev_hidden_source, cu_q, accept_lens)
             self.finalize_draft_cache(seqs, draft_tokens, final_hidden, accept_lens, k_list)
             return None
         if self.spec_debug:
             self._spec_sync()
             t0 = perf_counter()
-        token_ids, accept_lens, prev_indices = self.accept_draft_tokens(
-            seqs,
-            draft_tokens,
-            target_logits,
-            temperatures,
-            k_list,
-            cu_q,
-            target_token_ids,
-            False,
-        )
+        accepted_draft_tokens = int(accept_lens.sum().item())
+        emitted_tokens = sum(len(toks) for toks in token_ids)
+        self.spec_stats["accepted_draft_tokens"] += accepted_draft_tokens
+        self.spec_stats["emitted_tokens"] += emitted_tokens
+        if self.world_size > 1:
+            dist.broadcast(accept_lens, src=0)
+        self._cache_prev_hidden(seqs, next_prev_hidden)
+        if use_tree_proposal:
+            cu_q = torch.arange(
+                len(seqs) + 1,
+                dtype=torch.int32,
+                device=next_prev_hidden.device,
+            )
+            self.replay_draft_cache(
+                seqs,
+                token_ids,
+                prev_token_hidden,
+                next_prev_hidden,
+                cu_q,
+                accepted_hidden_rows=accepted_hidden_rows,
+            )
+        else:
+            self.finalize_draft_cache(seqs, draft_tokens, final_hidden, accept_lens, k_list)
         if self.spec_debug:
             self._spec_sync()
             self.spec_stats["accept_time"] += perf_counter() - t0
-            self.spec_stats["accepted_tokens"] += sum(len(toks) for toks in token_ids)
-            self.spec_stats["accepted_draft_tokens"] += sum(max(len(toks) - 1, 0) for toks in token_ids)
-        if self.world_size > 1:
-            dist.broadcast(accept_lens, src=0)
-        self._cache_prev_hidden_from_indices(seqs, prev_hidden_source, prev_indices)
-        self.finalize_draft_cache(seqs, draft_tokens, final_hidden, accept_lens, k_list)
         return token_ids
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:

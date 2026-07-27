@@ -1,46 +1,37 @@
-# vLLM Eagle3 Benchmark
+# vLLM EAGLE-3 对照基准
 
-在 `conda activate vllm` 环境里运行。
+这个脚本和 `bench_spec_decode.py` 共用固定自然语言 workload、tokenizer
+整理逻辑和 digest，用于对照 vLLM baseline 与 vLLM EAGLE-3。正式结果使用
+vLLM 0.13.0 和 `conda` 环境 `vllm`。
 
-默认脚本会：
-- 使用本地 `Qwen3-1.7B` 作为 target
-- 使用本地 `Qwen3-1.7B_eagle3` 作为 draft
-- 默认使用更适合本地 16GB GPU 的 `--gpu-memory-utilization 0.7` 和 `--max-model-len 2048`
-- 先 warmup，再分别跑 baseline 和 Eagle3 speculative decoding
-- 输出 output throughput、acceptance length、draft acceptance rate
-
-脚本在 `temperature=0` 且 `top_k<=0` 时，会自动把实际采样配置收成 `top_k=1`。
-这和 greedy 语义等价，但可以避免本地小显存机器在 speculative rejection sampler 初始化时做全 vocab sort 导致 OOM。
-
-## 常用命令
-
-温度 `0`：
+推荐从仓库根目录运行一键脚本：
 
 ```bash
-python vllm_test/bench_vllm_eagle3.py \
-  --temperature 0.0 \
+./scripts/benchmark_resume.sh
+```
+
+只运行 vLLM：
+
+```bash
+conda activate vllm
+PYTHONNOUSERSITE=1 python vllm_test/bench_vllm_eagle3.py \
+  --target-model ./huggingface/Qwen3-1.7B \
+  --draft-model ./huggingface/AngelSlim/Qwen3-1.7B_eagle3 \
+  --batch-size 16 \
+  --input-length 128 \
+  --output-length 128 \
+  --warmup-runs 1 \
+  --repeats 3 \
   --num-spec-tokens 3 \
-  --max-tokens 128 \
-  --num-prompts 16 \
-  --output-json vllm_test/result_t0.json
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.7 \
+  --output-json benchmarks/results/rtx5060ti_qwen3_1_7b/vllm.json \
+  --output-markdown benchmarks/results/rtx5060ti_qwen3_1_7b/vllm.md
 ```
 
-温度 `1`：
+脚本固定使用 `temperature=0`、`top_p=1`、`top_k=1`、`ignore_eos=True`
+和 seed 42。吞吐按实际 output token 数计算。请求级 TTFT、TPOT 和端到端延迟
+来自 vLLM request metrics，接受指标来自 vLLM Prometheus metrics。device peak
+由 NVML 采样，因此不要和 nano 的 PyTorch allocator peak 直接比较。
 
-```bash
-python vllm_test/bench_vllm_eagle3.py \
-  --temperature 1.0 \
-  --num-spec-tokens 3 \
-  --max-tokens 128 \
-  --num-prompts 16 \
-  --output-json vllm_test/result_t1.json
-```
-
-如果想换 prompt 文件：
-
-```bash
-python vllm_test/bench_vllm_eagle3.py \
-  --prompt-file path/to/prompts.txt
-```
-
-`prompts.txt` 一行一个 prompt，脚本会循环使用直到满足 `--num-prompts`。
+旧的温度和适配实验保存在 [`legacy`](legacy)，不属于正式三次结果。

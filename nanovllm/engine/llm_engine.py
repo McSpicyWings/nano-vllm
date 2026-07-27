@@ -20,8 +20,10 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
+        self._request_metrics = {}
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
@@ -66,16 +68,50 @@ class LLMEngine:
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        arrival_time: float | None = None,
+    ):
+        if self.config.draft_model is not None and sampling_params.temperature > 0:
+            raise ValueError(
+                "EAGLE-3 speculative decoding currently supports greedy sampling only "
+                "(temperature=0); rejection sampling is not implemented."
+            )
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        self._request_metrics[seq.seq_id] = {
+            "arrival_time": perf_counter() if arrival_time is None else arrival_time,
+            "first_token_time": None,
+            "finished_time": None,
+        }
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        completion_counts = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
+        step_end = perf_counter()
+        finished_seq_ids = []
+        for seq in seqs:
+            metrics = self._request_metrics.get(seq.seq_id)
+            if metrics is not None:
+                if (
+                    completion_counts[seq.seq_id] == 0
+                    and seq.num_completion_tokens > 0
+                    and metrics["first_token_time"] is None
+                ):
+                    metrics["first_token_time"] = step_end
+                if seq.is_finished:
+                    metrics["finished_time"] = step_end
+            if seq.is_finished:
+                finished_seq_ids.append(seq.seq_id)
+        if finished_seq_ids:
+            self.model_runner.call("release_sequences", finished_seq_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         
         # Calculate num_tokens for throughput tracking
@@ -97,13 +133,17 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+        return_metrics: bool = False,
+    ) -> list[dict]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        if len(prompts) != len(sampling_params):
+            raise ValueError("prompts and sampling_params must have the same length")
+        batch_start = perf_counter()
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            self.add_request(prompt, sp, arrival_time=batch_start)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
@@ -119,11 +159,31 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+                metrics = self._request_metrics.pop(seq_id)
+                outputs[seq_id] = (token_ids, metrics)
                 if use_tqdm:
                     pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        ordered_outputs = []
+        for seq_id in sorted(outputs.keys()):
+            token_ids, metrics = outputs[seq_id]
+            item = {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            if return_metrics:
+                arrival_time = metrics["arrival_time"]
+                first_token_time = metrics["first_token_time"]
+                finished_time = metrics["finished_time"]
+                assert first_token_time is not None and finished_time is not None
+                item["metrics"] = {
+                    "ttft_ms": (first_token_time - arrival_time) * 1000,
+                    "tpot_ms": (
+                        (finished_time - first_token_time) * 1000 / (len(token_ids) - 1)
+                        if len(token_ids) > 1 else 0.0
+                    ),
+                    "e2e_ms": (finished_time - arrival_time) * 1000,
+                }
+            ordered_outputs.append(item)
         if use_tqdm:
             pbar.close()
-        return outputs
+        return ordered_outputs
+
+    def get_spec_stats(self, reset: bool = False) -> dict:
+        return self.model_runner.call("get_spec_stats", reset)

@@ -19,8 +19,12 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/McSpicyWings/nano-vllm"
+Upstream="https://github.com/GeeeekExplorer/nano-vllm"
 
 [tool.setuptools.packages.find]
 where = ["."]

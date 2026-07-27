@@ -1,0 +1,38 @@
+============================================================
+Speculative Decoding Benchmark
+============================================================
+Number of sequences: 32
+Max input length: 512
+Max output length: 256
+
+------------------------------------------------------------
+Test 1: Baseline (no speculative decoding)
+------------------------------------------------------------
+`torch_dtype` is deprecated! Use `dtype` instead!
+Generating:   0%|          | 0/1 [00:00<?, ?it/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=0tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=100tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=104tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=103tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=101tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=103tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=103tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=103tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=102tok/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=9tok/s, Decode=101tok/s]Generating: 100%|██████████| 1/1 [00:00<00:00,  1.44it/s, Prefill=9tok/s, Decode=101tok/s]Generating: 100%|██████████| 1/1 [00:00<00:00,  1.44it/s, Prefill=9tok/s, Decode=101tok/s]
+Total tokens: 4689
+Time: 3.75s
+Throughput: 1250.19 tok/s
+
+------------------------------------------------------------
+Test 2: With speculative decoding (Eagle3 draft)
+------------------------------------------------------------
+`torch_dtype` is deprecated! Use `dtype` instead!
+Generating:   0%|          | 0/1 [00:00<?, ?it/s]Generating:   0%|          | 0/1 [00:00<?, ?it/s, Prefill=10tok/s, Decode=0tok/s][rank0]:W0328 10:48:14.947000 3870208 site-packages/torch/_dynamo/convert_frame.py:964] [0/8] torch._dynamo hit config.recompile_limit (8)
+[rank0]:W0328 10:48:14.947000 3870208 site-packages/torch/_dynamo/convert_frame.py:964] [0/8]    function: 'rms_forward' (/home/wpc/nano-vllm/nanovllm/layers/layernorm.py:16)
+[rank0]:W0328 10:48:14.947000 3870208 site-packages/torch/_dynamo/convert_frame.py:964] [0/8]    last reason: 0/7: tensor 'x' rank mismatch. expected 2, actual 3
+[rank0]:W0328 10:48:14.947000 3870208 site-packages/torch/_dynamo/convert_frame.py:964] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank0]:W0328 10:48:14.947000 3870208 site-packages/torch/_dynamo/convert_frame.py:964] [0/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html.
+Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=1tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=27tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=30tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=29tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=28tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=28tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=29tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=28tok/s]Generating:   0%|          | 0/1 [00:01<?, ?it/s, Prefill=10tok/s, Decode=30tok/s]Generating: 100%|██████████| 1/1 [00:01<00:00,  1.46s/it, Prefill=10tok/s, Decode=30tok/s]Generating: 100%|██████████| 1/1 [00:01<00:00,  1.46s/it, Prefill=10tok/s, Decode=30tok/s]
+Total tokens: 4689
+Time: 12.30s
+Throughput: 381.19 tok/s
+
+============================================================
+Comparison
+============================================================
+Baseline throughput: 1250.19 tok/s
+Speculative throughput: 381.19 tok/s
+Speedup: 0.30x
+
+Benchmark completed.

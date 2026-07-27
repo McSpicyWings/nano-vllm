@@ -1,0 +1,120 @@
+{
+  "engine": "nano-vllm",
+  "environment": {
+    "nano_vllm": "0.2.0",
+    "python": "3.12.12",
+    "torch": "2.7.0+cu128",
+    "torch_cuda": "12.8",
+    "transformers": "4.57.1",
+    "gpu": "NVIDIA GeForce RTX 5060 Ti",
+    "gpu_total_memory_gib": 15.4600830078125,
+    "python_executable": "/home/wpc/.local/opt/miniforge3/envs/nano-vllm/bin/python",
+    "python_no_user_site": true
+  },
+  "config": {
+    "target_model": "./huggingface/Qwen3-1.7B",
+    "draft_model": "./huggingface/AngelSlim/Qwen3-1.7B_eagle3",
+    "batch_size": 16,
+    "input_length": 128,
+    "output_length": 32,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "ignore_eos": true,
+    "seed": 42,
+    "num_spec_tokens": 3,
+    "speculative_token_tree": "[(0,), (1,), (0, 0), (1, 0), (0, 0, 0), (1, 0, 0)]",
+    "max_model_len": 2048,
+    "num_kvcache_blocks": 64,
+    "warmup_runs": 1,
+    "repeats": 1,
+    "workload_sha256": "6cc3bda376604d06b504f2f16d1c1abe8bd36dc64d3518bf7b14391d5e1790e7"
+  },
+  "cases": {
+    "nano_eagle3_tree": {
+      "case_name": "nano_eagle3_tree",
+      "runs": [
+        {
+          "elapsed_s": 2.1724563371390104,
+          "total_prompt_tokens": 2048,
+          "total_output_tokens": 512,
+          "output_tokens_per_s": 235.6779242220684,
+          "ttft_ms_mean": 145.78354405239224,
+          "ttft_ms_p50": 145.78354405239224,
+          "ttft_ms_p95": 145.78354405239224,
+          "tpot_ms_mean": 62.90586393856022,
+          "tpot_ms_p50": 63.20641828220217,
+          "tpot_ms_p95": 65.36450028239238,
+          "e2e_ms_mean": 2095.8653261477593,
+          "acceptance_rate": 0.02635658914728682,
+          "mean_acceptance_length": 1.0735930735930737,
+          "mean_accepted_draft_length": 0.0735930735930736,
+          "sequence_proposals": 462,
+          "proposed_tokens": 1290,
+          "accepted_draft_tokens": 34,
+          "emitted_tokens": 496,
+          "phase_time_ms_per_step": {
+            "seed": 0.0,
+            "draft": 14.622222286679092,
+            "verify": 49.20829045436075,
+            "accept": 1.319335863715218
+          },
+          "output_sha256": "6cd235c9c473f66fcf013565ce6f868badd755ddfe5b708fcf874e48b2d30458"
+        }
+      ],
+      "aggregate": {
+        "elapsed_s": {
+          "mean": 2.1724563371390104,
+          "std": 0.0
+        },
+        "output_tokens_per_s": {
+          "mean": 235.6779242220684,
+          "std": 0.0
+        },
+        "ttft_ms_mean": {
+          "mean": 145.78354405239224,
+          "std": 0.0
+        },
+        "ttft_ms_p50": {
+          "mean": 145.78354405239224,
+          "std": 0.0
+        },
+        "ttft_ms_p95": {
+          "mean": 145.78354405239224,
+          "std": 0.0
+        },
+        "tpot_ms_mean": {
+          "mean": 62.90586393856022,
+          "std": 0.0
+        },
+        "tpot_ms_p50": {
+          "mean": 63.20641828220217,
+          "std": 0.0
+        },
+        "tpot_ms_p95": {
+          "mean": 65.36450028239238,
+          "std": 0.0
+        },
+        "e2e_ms_mean": {
+          "mean": 2095.8653261477593,
+          "std": 0.0
+        },
+        "acceptance_rate": {
+          "mean": 0.02635658914728682,
+          "std": 0.0
+        },
+        "mean_acceptance_length": {
+          "mean": 1.0735930735930737,
+          "std": 0.0
+        },
+        "mean_accepted_draft_length": {
+          "mean": 0.0735930735930736,
+          "std": 0.0
+        },
+        "all_output_digests_equal": true
+      },
+      "torch_peak_allocated_gib": 5.464359283447266,
+      "error": null
+    }
+  }
+}
