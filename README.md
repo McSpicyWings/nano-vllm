@@ -246,4 +246,4 @@ step 的 draft、target verification、accept/cache 分别约为 2.37、21.06、
 > 10.37 ms 降至 7.56 ms，吞吐达到 baseline 的 0.95x，与同负载 vLLM 的
 > 0.945x 相当。
 
-项目仓库：[McSpicyWings/nano-vllm](https://github.com/McSpicyWings/nano-vllm)
+项目仓库：[McSpicyWings/nano-vllm（wpc）](https://github.com/McSpicyWings/nano-vllm/tree/wpc)
