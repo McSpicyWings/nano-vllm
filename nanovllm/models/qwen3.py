@@ -185,13 +185,17 @@ class Qwen3Model(nn.Module):
         if return_aux_hidden_states:
             if aux_hidden_state_layer_ids is None:
                 num_layers = len(self.layers)
-                aux_hidden_state_layer_ids = [1, num_layers // 2, num_layers - 4]
+                aux_hidden_state_layer_ids = [2, num_layers // 2, num_layers - 3]
             aux_capture_ids = [idx for idx in aux_hidden_state_layer_ids if 0 <= idx < len(self.layers)]
             aux_capture_set = set(aux_capture_ids)
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(positions, hidden_states, residual)
             if layer_idx in aux_capture_set:
-                aux_list.append(hidden_states + residual)
+                # vLLM's EAGLE-3 interface records the residual stream at the
+                # input of the selected target layer, not its output.
+                aux_list.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
+            hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         if return_aux_hidden_states:
             if aux_capture_ids:

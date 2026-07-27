@@ -7,6 +7,7 @@ import argparse
 import gc
 import hashlib
 import json
+from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
@@ -65,6 +66,7 @@ def run_case(
         "max_num_seqs": len(prompts),
         "num_kvcache_blocks": max(16, len(prompts) * 2),
         "num_spec_tokens": 3,
+        "spec_verifier_mode": "sequential",
     }
     if name != "baseline":
         kwargs["draft_model"] = draft
@@ -126,6 +128,7 @@ def check_repeated_cleanup(
         max_num_seqs=1,
         num_kvcache_blocks=16,
         num_spec_tokens=3,
+        spec_verifier_mode="sequential",
     )
     allocations = []
     reference = None
@@ -163,6 +166,7 @@ def main() -> None:
     parser.add_argument("--input-length", type=int, default=128)
     parser.add_argument("--output-length", type=int, default=32)
     parser.add_argument("--skip-boundary", action="store_true")
+    parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model, use_fast=True)
@@ -207,6 +211,11 @@ def main() -> None:
     }
     print(f"PASS repeated_cleanup: {cleanup_allocations}")
 
+    if args.output_json:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
+        )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 

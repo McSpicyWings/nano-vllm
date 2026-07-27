@@ -22,6 +22,7 @@ class Config:
     # Single-step speculative tokens; keep 1 for MVP.
     num_spec_tokens: int = 5
     speculative_token_tree: str | None = None
+    spec_verifier_mode: str = "packed"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -29,6 +30,7 @@ class Config:
             assert os.path.isdir(self.draft_model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.spec_verifier_mode in {"packed", "sequential"}
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.draft_model is not None:
             self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)

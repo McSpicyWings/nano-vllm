@@ -86,6 +86,7 @@ class LLMEngine:
             "arrival_time": perf_counter() if arrival_time is None else arrival_time,
             "first_token_time": None,
             "finished_time": None,
+            "detokenize": sampling_params.detokenize,
         }
         self.scheduler.add(seq)
         return seq.seq_id
@@ -166,7 +167,8 @@ class LLMEngine:
         ordered_outputs = []
         for seq_id in sorted(outputs.keys()):
             token_ids, metrics = outputs[seq_id]
-            item = {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            text = self.tokenizer.decode(token_ids) if metrics["detokenize"] else ""
+            item = {"text": text, "token_ids": token_ids}
             if return_metrics:
                 arrival_time = metrics["arrival_time"]
                 first_token_time = metrics["first_token_time"]

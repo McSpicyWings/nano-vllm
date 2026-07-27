@@ -86,7 +86,15 @@ def summarize_outputs(
     if spec_stats.get("timing_enabled") and spec_calls > 0:
         phase_time_ms_per_step = {
             phase: float(spec_stats[f"{phase}_time"]) * 1000 / spec_calls
-            for phase in ("seed", "draft", "verify", "accept")
+            for phase in (
+                "seed",
+                "draft",
+                "verify",
+                "verify_model",
+                "verify_logits",
+                "verify_accept",
+                "accept",
+            )
         }
     return RunResult(
         elapsed_s=elapsed_s,
@@ -161,6 +169,7 @@ def _run_case_worker(
     repeats: int,
     warmup_runs: int,
     num_spec_tokens: int,
+    spec_verifier_mode: str,
     speculative_token_tree: str,
     max_model_len: int,
     num_kvcache_blocks: int,
@@ -179,6 +188,7 @@ def _run_case_worker(
             "max_num_seqs": len(prompt_token_ids),
             "num_kvcache_blocks": num_kvcache_blocks,
             "num_spec_tokens": num_spec_tokens,
+            "spec_verifier_mode": spec_verifier_mode,
         }
         if case_name != "nano_baseline":
             kwargs["draft_model"] = draft_model
@@ -189,6 +199,7 @@ def _run_case_worker(
         sampling_params = SamplingParams(
             temperature=0,
             ignore_eos=True,
+            detokenize=False,
             max_tokens=output_length,
         )
         for _ in range(warmup_runs):
@@ -324,6 +335,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--num-spec-tokens", type=int, default=3)
+    parser.add_argument(
+        "--spec-verifier-mode",
+        choices=["packed", "sequential"],
+        default="packed",
+    )
     parser.add_argument("--speculative-token-tree", default=DEFAULT_TREE)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
@@ -358,6 +374,7 @@ def main() -> None:
         "repeats": args.repeats,
         "warmup_runs": args.warmup_runs,
         "num_spec_tokens": args.num_spec_tokens,
+        "spec_verifier_mode": args.spec_verifier_mode,
         "speculative_token_tree": args.speculative_token_tree,
         "max_model_len": args.max_model_len,
         "num_kvcache_blocks": args.num_kvcache_blocks,
@@ -379,6 +396,7 @@ def main() -> None:
             "ignore_eos": True,
             "seed": args.seed,
             "num_spec_tokens": args.num_spec_tokens,
+            "spec_verifier_mode": args.spec_verifier_mode,
             "speculative_token_tree": args.speculative_token_tree,
             "max_model_len": args.max_model_len,
             "num_kvcache_blocks": args.num_kvcache_blocks,

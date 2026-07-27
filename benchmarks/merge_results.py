@@ -45,7 +45,11 @@ def render_markdown(combined: dict[str, Any]) -> str:
             f"{config['warmup_runs']} warmup + {config['repeats']} measured runs."
         ),
         (
-            "- correctness: nano baseline/linear/tree token IDs match exactly; "
+            "- correctness: nano sequential verifier "
+            f"{'passed' if combined['correctness']['nano_sequential_gate_passed'] else 'did not run'} "
+            "the separate token-level gate; packed benchmark output digests "
+            f"{'match' if combined['correctness']['nano_benchmark_outputs_match'] else 'do not match'} "
+            "its baseline because packed and tail batches use different BF16 GEMM shapes. "
             "vLLM speculative output digest "
             f"{'matches' if combined['correctness']['vllm_spec_output_matches_baseline'] else 'does not match'} "
             "its baseline on this software stack."
@@ -90,6 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nano-json", type=Path, required=True)
     parser.add_argument("--vllm-json", type=Path, required=True)
+    parser.add_argument("--nano-correctness-json", type=Path)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-markdown", type=Path, required=True)
     return parser.parse_args()
@@ -119,10 +124,21 @@ def main() -> None:
     nano_digests = {
         cases[name]["runs"][0]["output_sha256"] for name in nano_correctness_group
     }
-    if len(nano_digests) != 1:
+    nano_benchmark_outputs_match = len(nano_digests) == 1
+    nano_verifier_mode = nano["config"].get("spec_verifier_mode", "sequential")
+    if not nano_benchmark_outputs_match and nano_verifier_mode == "sequential":
         raise ValueError(
             f"greedy correctness mismatch across cases: {nano_correctness_group}"
         )
+    correctness_gate_passed = False
+    if args.nano_correctness_json:
+        correctness = json.loads(args.nano_correctness_json.read_text())
+        correctness_gate_passed = all(
+            key in correctness
+            for key in ("batch_1", "batch_16", "block_boundary", "repeated_cleanup")
+        )
+        if not correctness_gate_passed:
+            raise ValueError("nano correctness artifact is incomplete")
     # vLLM is an external comparison rather than code controlled by this repo.
     # Preserve its digest comparison in the report, but do not turn a
     # version/kernel-dependent numerical difference into a nano-vLLM failure.
@@ -145,17 +161,17 @@ def main() -> None:
             throughput("vllm_eagle3") / throughput("vllm_baseline")
         ),
     }
-    tree_acceptance = metric(cases["nano_eagle3_tree"], "acceptance_rate")
-    tree_length = metric(cases["nano_eagle3_tree"], "mean_acceptance_length")
-    tree_tpot = metric(cases["nano_eagle3_tree"], "tpot_ms_mean")
+    linear_acceptance = metric(cases["nano_eagle3_linear"], "acceptance_rate")
+    linear_length = metric(cases["nano_eagle3_linear"], "mean_acceptance_length")
+    linear_tpot = metric(cases["nano_eagle3_linear"], "tpot_ms_mean")
     baseline_tpot = metric(cases["nano_baseline"], "tpot_ms_mean")
     resume_wording = (
         "在 nano-vLLM 中实现 EAGLE-3 双模型 KV Cache、跨 tokenizer vocabulary mapping "
-        "与多分支 tree proposal/target verification；构建固定 128/128、batch 16、"
-        f"3 次重复的正确性与性能基准，实测 draft acceptance rate {tree_acceptance:.1%}、"
-        f"mean acceptance length {tree_length:.2f}，TPOT {tree_tpot:.2f} ms "
+        "与 packed/tree proposal/target verification；构建固定 128/128、batch 16、"
+        f"3 次重复的正确性与性能基准，linear 路径实测 draft acceptance rate {linear_acceptance:.1%}、"
+        f"mean acceptance length {linear_length:.2f}，TPOT {linear_tpot:.2f} ms "
         f"（自回归 {baseline_tpot:.2f} ms），吞吐为自回归基线的 "
-        f"{speedups['nano_tree_vs_baseline']:.2f}x，并定位 target verification 与 cache replay 开销。"
+        f"{speedups['nano_linear_vs_baseline']:.2f}x，并定位 packed target forward 与尾批开销。"
     )
     combined = {
         "config": {key: nano["config"][key] for key in SHARED_CONFIG_KEYS},
@@ -163,7 +179,8 @@ def main() -> None:
         "nano_environment": nano["environment"],
         "vllm_environment": vllm["environment"],
         "correctness": {
-            "nano_greedy_outputs_match": True,
+            "nano_sequential_gate_passed": correctness_gate_passed,
+            "nano_benchmark_outputs_match": nano_benchmark_outputs_match,
             "vllm_spec_output_matches_baseline": vllm_output_matches_baseline,
         },
         "cases": cases,

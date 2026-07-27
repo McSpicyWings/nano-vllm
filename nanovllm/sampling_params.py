@@ -6,6 +6,7 @@ class SamplingParams:
     temperature: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
+    detokenize: bool = True
 
     def __post_init__(self):
         assert self.temperature >= 0.0, "temperature must be non-negative"

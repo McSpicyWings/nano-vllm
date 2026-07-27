@@ -1,0 +1,22 @@
+{
+  "batch_1": {
+    "requests": 1,
+    "output_sha256": "7464e4afc6d76f6489cfa4ee245b4d3d3dcfc3c909796452137b41021f4576ed"
+  },
+  "batch_16": {
+    "requests": 16,
+    "output_sha256": "3a0869b69cee4c69ca3c3ffbe09a0deeb295fa7042a3d83a87ceebb9210e8a22"
+  },
+  "block_boundary": {
+    "requests": 1,
+    "output_sha256": "3651800ba683046f80efa22446fb8ba75fa18bf07c5cd399ddeaa9bc0b594c8e"
+  },
+  "repeated_cleanup": {
+    "runs": 3,
+    "allocated_bytes": [
+      4234189824,
+      4234189824,
+      4234189824
+    ]
+  }
+}

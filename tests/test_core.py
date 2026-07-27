@@ -45,6 +45,19 @@ def test_full_vocab_target_fallback_is_not_limited_to_draft_vocab() -> None:
     assert accept_lens.tolist() == [0]
 
 
+def test_greedy_acceptance_emits_bonus_after_full_match() -> None:
+    runner = object.__new__(ModelRunner)
+    token_ids, accept_lens, prev_indices = runner.accept_greedy_target_ids(
+        torch.tensor([[1, 2]]),
+        torch.tensor([1, 2, 4]),
+        [2],
+        torch.tensor([0, 3], dtype=torch.int32),
+    )
+    assert token_ids == [[1, 2, 4]]
+    assert accept_lens.tolist() == [2]
+    assert prev_indices.tolist() == [2]
+
+
 def test_spec_stats_use_sequence_level_denominator_and_reset() -> None:
     runner = object.__new__(ModelRunner)
     runner.spec_stats = {

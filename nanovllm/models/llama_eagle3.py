@@ -70,9 +70,6 @@ class LlamaEagle3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -84,9 +81,6 @@ class LlamaEagle3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
@@ -256,6 +250,11 @@ class LlamaEagle3ForCausalLM(nn.Module):
         
         # Optional: draft->target mapping used to turn draft head outputs into target token ids.
         self.register_buffer("d2t", torch.empty(0, dtype=torch.int64), persistent=False)
+        self.register_buffer(
+            "draft_to_target_ids",
+            torch.empty(0, dtype=torch.int64),
+            persistent=False,
+        )
         # Optional: target->draft mapping is loaded for debugging but not consumed in the
         # forward_with_hidden path where inputs stay in target token space.
         self.register_buffer("t2d", torch.empty(0, dtype=torch.int64), persistent=False)
@@ -353,6 +352,14 @@ class LlamaEagle3ForCausalLM(nn.Module):
         """
         mapping = mapping.long()
         self.d2t = mapping
+        self.draft_to_target_ids = (
+            torch.arange(
+                mapping.numel(),
+                dtype=torch.int64,
+                device=mapping.device,
+            )
+            + mapping
+        )
         self.vocab_mapping = mapping
 
     def set_target_to_draft_mapping(self, mapping: torch.Tensor):
@@ -366,9 +373,7 @@ class LlamaEagle3ForCausalLM(nn.Module):
     def get_draft_target_ids(self, device: torch.device | None = None) -> torch.Tensor:
         if self.d2t.numel() == 0:
             return torch.arange(self.draft_vocab_size, device=device, dtype=torch.int64)
-        offsets = self.d2t.to(device=device)
-        base = torch.arange(offsets.numel(), device=offsets.device, dtype=torch.int64)
-        return base + offsets
+        return self.draft_to_target_ids.to(device=device)
 
     def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         target_ids = self.get_draft_target_ids(draft_token_ids.device)

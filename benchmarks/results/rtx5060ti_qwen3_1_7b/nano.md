@@ -5,6 +5,6 @@
 
 | Case | Output tok/s | TTFT mean (ms) | TPOT mean (ms) | Acceptance | Accept length | Peak allocated (GiB) |
 |---|---:|---:|---:|---:|---:|---:|
-| nano_baseline | 1398.54 | 137.68 | 10.44 | - | - | 5.10 |
-| nano_eagle3_linear | 287.59 | 144.97 | 52.92 | 1.66% | 1.049 | 5.46 |
-| nano_eagle3_tree | 212.83 | 145.42 | 69.99 | 4.89% | 1.144 | 5.46 |
+| nano_baseline | 1406.88 | 137.68 | 10.38 | - | - | 5.10 |
+| nano_eagle3_linear | 1124.60 | 144.96 | 8.13 | 47.03% | 2.385 | 5.47 |
+| nano_eagle3_tree | 248.26 | 144.99 | 48.60 | 49.63% | 2.460 | 5.47 |

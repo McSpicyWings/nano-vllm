@@ -45,6 +45,9 @@ class ModelRunner:
             seed_time=0.0,
             draft_time=0.0,
             verify_time=0.0,
+            verify_model_time=0.0,
+            verify_logits_time=0.0,
+            verify_accept_time=0.0,
             accept_time=0.0,
         )
         self.eagle_aux_hidden_state_layer_ids: list[int] | None = None
@@ -75,7 +78,11 @@ class ModelRunner:
                 self.eagle_aux_hidden_state_layer_ids = list(self.model.get_eagle3_aux_hidden_state_layers())
             else:
                 num_layers = config.hf_config.num_hidden_layers
-                self.eagle_aux_hidden_state_layer_ids = [1, num_layers // 2, num_layers - 4]
+                self.eagle_aux_hidden_state_layer_ids = [
+                    2,
+                    num_layers // 2,
+                    num_layers - 3,
+                ]
         self.sampler = Sampler()
         self.warmup_model()
         # Warmup sequences are synthetic and never pass through Scheduler cleanup.
@@ -85,6 +92,13 @@ class ModelRunner:
             self.allocate_kv_cache(self.draft_model, config.draft_hf_config)
         if not self.enforce_eager:
             self.capture_cudagraph()
+            if (
+                self.draft_model is not None
+                and self.world_size == 1
+                and self.config.num_spec_tokens > 0
+            ):
+                self.capture_spec_verify_cudagraph()
+                self.capture_draft_step_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -119,10 +133,14 @@ class ModelRunner:
                 except Exception:
                     pass
         if not self.enforce_eager:
-            try:
-                del self.graphs, self.graph_pool
-            except Exception:
-                pass
+            for attr in (
+                "graphs",
+                "spec_verify_graphs",
+                "draft_step_graphs",
+                "graph_pool",
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
         try:
             torch.cuda.synchronize()
         except Exception:
@@ -647,53 +665,199 @@ class ModelRunner:
     def prefill_draft_cache(self, seqs: list[Sequence]):
         if self.draft_model is None:
             return
-        input_ids = []
-        positions = []
-        cu_seqlens = [0]
-        max_seqlen = 0
-        slot_mapping = []
+        target_input_ids = []
+        target_positions = []
+        target_cu_seqlens = [0]
+        target_slot_mapping = []
+        target_max_seqlen = 0
         for seq in seqs:
             if not seq.block_table:
                 continue
             seqlen = len(seq)
-            input_ids.extend(seq.token_ids)
-            positions.extend(range(seqlen))
-            cu_seqlens.append(cu_seqlens[-1] + seqlen)
-            max_seqlen = max(max_seqlen, seqlen)
-            for block_idx, block_id in enumerate(seq.block_table):
-                start = block_id * self.block_size
-                if block_idx != len(seq.block_table) - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens
-                slot_mapping.extend(range(start, end))
-        if not input_ids:
+            target_input_ids.extend(seq.token_ids)
+            target_positions.extend(range(seqlen))
+            target_cu_seqlens.append(target_cu_seqlens[-1] + seqlen)
+            target_max_seqlen = max(target_max_seqlen, seqlen)
+            target_slot_mapping.extend(
+                self._slot_for_position(seq, position)
+                for position in range(seqlen)
+            )
+        if not target_input_ids:
             return
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        draft_hidden = None
+        target_input_ids = torch.tensor(
+            target_input_ids,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        target_positions = torch.tensor(
+            target_positions,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        target_cu_seqlens = torch.tensor(
+            target_cu_seqlens,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        target_slot_mapping = torch.tensor(
+            target_slot_mapping,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        target_hidden_states = None
         if bool(getattr(self.draft_model, "use_aux_hidden_state", False)):
             set_context(
                 True,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
-                slot_mapping,
+                target_cu_seqlens,
+                target_cu_seqlens,
+                target_max_seqlen,
+                target_max_seqlen,
+                target_slot_mapping,
                 None,
                 None,
             )
             _, aux_hidden_states = self.model(
-                input_ids,
-                positions,
+                target_input_ids,
+                target_positions,
                 return_aux_hidden_states=True,
                 aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
             )
             reset_context()
             if aux_hidden_states.numel():
-                draft_hidden = self.draft_model.combine_hidden_states(aux_hidden_states)
+                target_hidden_states = aux_hidden_states
+
+        draft_input_ids = []
+        draft_positions = []
+        draft_slot_mapping = []
+        draft_hidden_rows = []
+        draft_cu_seqlens = [0]
+        draft_max_seqlen = 0
+        target_offset = 0
+        for seq in seqs:
+            seqlen = len(seq)
+            draft_len = max(seqlen - 1, 0)
+            draft_input_ids.extend(seq.token_ids[1:])
+            draft_positions.extend(range(draft_len))
+            draft_slot_mapping.extend(
+                self._slot_for_position(seq, position)
+                for position in range(draft_len)
+            )
+            if target_hidden_states is not None and draft_len:
+                draft_hidden_rows.append(
+                    target_hidden_states[
+                        target_offset : target_offset + draft_len
+                    ]
+                )
+            target_offset += seqlen
+            draft_cu_seqlens.append(
+                draft_cu_seqlens[-1] + draft_len
+            )
+            draft_max_seqlen = max(draft_max_seqlen, draft_len)
+        if not draft_input_ids:
+            return
+        draft_input_ids = torch.tensor(
+            draft_input_ids,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        draft_positions = torch.tensor(
+            draft_positions,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        draft_slot_mapping = torch.tensor(
+            draft_slot_mapping,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        draft_cu_seqlens = torch.tensor(
+            draft_cu_seqlens,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        draft_hidden = (
+            self.draft_model.combine_hidden_states(
+                torch.cat(draft_hidden_rows, dim=0)
+            )
+            if draft_hidden_rows
+            else None
+        )
+        set_context(
+            True,
+            draft_cu_seqlens,
+            draft_cu_seqlens,
+            draft_max_seqlen,
+            draft_max_seqlen,
+            draft_slot_mapping,
+            None,
+            None,
+        )
+        _ = self.draft_model(
+            draft_input_ids,
+            draft_positions,
+            hidden_states=draft_hidden,
+        )
+        reset_context()
+
+    @torch.inference_mode()
+    def fill_draft_cache_from_prefill(
+        self,
+        seqs: list[Sequence],
+        target_hidden_states: torch.Tensor,
+    ) -> None:
+        if self.draft_model is None:
+            return
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        hidden_rows = []
+        cu_seqlens = [0]
+        max_seqlen = 0
+        target_offset = 0
+        for seq in seqs:
+            target_query_len = len(seq) - seq.num_cached_tokens
+            if seq.num_cached_tokens != 0:
+                raise RuntimeError("fused EAGLE-3 prefill requires an uncached prompt")
+            draft_query_len = max(target_query_len - 1, 0)
+            if draft_query_len:
+                # EAGLE is trained on (target hidden at token i, embedding of
+                # token i+1). Shift token ids left while keeping positions and
+                # target hidden states unshifted, matching vLLM's proposer.
+                input_ids.extend(seq.token_ids[1:])
+                positions.extend(range(draft_query_len))
+                slot_mapping.extend(
+                    (
+                        self._slot_for_position(seq, position)
+                        if seq.block_table
+                        else position
+                    )
+                    for position in range(draft_query_len)
+                )
+                hidden_rows.append(
+                    target_hidden_states[
+                        target_offset : target_offset + draft_query_len
+                    ]
+                )
+            target_offset += target_query_len
+            cu_seqlens.append(cu_seqlens[-1] + draft_query_len)
+            max_seqlen = max(max_seqlen, draft_query_len)
+        if not input_ids:
+            return
+        input_ids = torch.tensor(
+            input_ids, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions = torch.tensor(
+            positions, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens = torch.tensor(
+            cu_seqlens, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        draft_hidden = self.draft_model.combine_hidden_states(
+            torch.cat(hidden_rows, dim=0)
+        )
         set_context(
             True,
             cu_seqlens,
@@ -706,17 +870,6 @@ class ModelRunner:
         )
         _ = self.draft_model(input_ids, positions, hidden_states=draft_hidden)
         reset_context()
-
-    @torch.inference_mode()
-    def fill_draft_cache_from_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        draft_hidden: torch.Tensor,
-    ) -> None:
-        if self.draft_model is None:
-            return
-        _ = self.draft_model(input_ids, positions, hidden_states=draft_hidden)
 
     @torch.inference_mode()
     def propose_linear_draft_tokens(
@@ -733,8 +886,8 @@ class ModelRunner:
             return draft_tokens[:, :0], self.draft_model.combine_hidden_states(prev_token_hidden), None, None
 
         active_k = torch.tensor(k_list, dtype=torch.int32, device="cuda")
-        base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        base_len = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        base_pos = torch.tensor([len(seq) - 2 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         cur_tokens = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, device="cuda")
         cur_hidden = self.draft_model.combine_hidden_states(prev_token_hidden)
@@ -743,7 +896,7 @@ class ModelRunner:
         for step in range(max_k):
             active = active_k > step
             step_slots = torch.tensor(
-                [self._slot_for_position(seq, len(seq) - 1 + step) for seq in seqs],
+                [self._slot_for_position(seq, len(seq) - 2 + step) for seq in seqs],
                 dtype=torch.int32,
                 pin_memory=True,
             ).cuda(non_blocking=True)
@@ -751,13 +904,33 @@ class ModelRunner:
             context_lens = torch.where(active, base_len + step, base_len)
             positions = base_pos + step
             set_context(False, slot_mapping=slot, context_lens=context_lens, block_tables=block_tables)
-            hidden_out, next_hidden = self.draft_model.forward_with_hidden(cur_tokens, positions, cur_hidden)
-            logits = self.draft_model.compute_logits(hidden_out)
+            graph_outputs = self.run_draft_step_graph(
+                cur_tokens,
+                positions,
+                cur_hidden,
+                slot,
+                context_lens,
+                block_tables,
+            )
+            if graph_outputs is None:
+                hidden_out, next_hidden = self.draft_model.forward_with_hidden(
+                    cur_tokens,
+                    positions,
+                    cur_hidden,
+                )
+                logits = self.draft_model.compute_logits(hidden_out)
+                next_target_tokens = (
+                    self.draft_model.map_draft_to_target(
+                        logits.argmax(dim=-1)
+                    )
+                    if self.rank == 0
+                    else torch.empty((bs,), dtype=torch.int64, device="cuda")
+                )
+            else:
+                hidden_out, next_hidden, next_target_tokens = graph_outputs
             if self.rank == 0:
                 # vLLM's EAGLE proposer uses greedy draft tokens today; keep q(logits)
                 # out of the hot path to avoid stochastic draft sampling overhead.
-                next_draft_tokens = logits.argmax(dim=-1)
-                next_target_tokens = self.draft_model.map_draft_to_target(next_draft_tokens)
                 next_target_tokens = torch.where(active, next_target_tokens, cur_tokens)
             else:
                 next_target_tokens = torch.empty((bs,), dtype=torch.int64, device="cuda")
@@ -787,10 +960,10 @@ class ModelRunner:
             or any(k != max_k for k in k_list)
         ):
             return self.propose_linear_draft_tokens(seqs, k_list, prev_token_hidden)
-        base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        base_len = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        base_pos = torch.tensor([len(seq) - 2 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         base_slot = torch.tensor(
-            [self._slot_for_position(seq, len(seq) - 1) for seq in seqs],
+            [self._slot_for_position(seq, len(seq) - 2) for seq in seqs],
             dtype=torch.int32,
             pin_memory=True,
         ).cuda(non_blocking=True)
@@ -953,6 +1126,66 @@ class ModelRunner:
 
     # Greedy verifier: accept draft tokens only while they match the target argmax.
     # On mismatch we fall back to the target sample for that step.
+    def accept_greedy_target_ids(
+        self,
+        draft_tokens: torch.Tensor,
+        target_ids: torch.Tensor,
+        k_list: list[int],
+        cu_q: torch.Tensor,
+    ) -> tuple[list[list[int]], torch.Tensor, torch.Tensor]:
+        bs = draft_tokens.size(0)
+        draft_len = k_list[0]
+        query_len = draft_len + 1
+        target_ids = target_ids.view(bs, query_len)
+        if draft_len:
+            prefix_matches = (
+                target_ids[:, :draft_len]
+                .eq(draft_tokens[:, :draft_len])
+                .to(torch.int32)
+                .cumprod(dim=1)
+            )
+            accept_lens = prefix_matches.sum(dim=1, dtype=torch.int32)
+        else:
+            prefix_matches = torch.empty(
+                (bs, 0),
+                dtype=torch.int32,
+                device=target_ids.device,
+            )
+            accept_lens = torch.zeros(
+                bs,
+                dtype=torch.int32,
+                device=target_ids.device,
+            )
+        output_tokens = torch.full(
+            (bs, query_len),
+            -1,
+            dtype=torch.int64,
+            device=target_ids.device,
+        )
+        if draft_len:
+            output_tokens[:, :draft_len] = torch.where(
+                prefix_matches.bool(),
+                draft_tokens[:, :draft_len],
+                -1,
+            )
+        fallback_tokens = target_ids.gather(
+            1,
+            accept_lens.to(torch.int64).unsqueeze(1),
+        )
+        output_tokens.scatter_(
+            1,
+            accept_lens.to(torch.int64).unsqueeze(1),
+            fallback_tokens,
+        )
+        out_tokens_per_seq = [
+            [token for token in row if token >= 0]
+            for row in output_tokens.cpu().tolist()
+        ]
+        prev_indices = (
+            cu_q[:-1].to(torch.int64) + accept_lens.to(torch.int64)
+        )
+        return out_tokens_per_seq, accept_lens, prev_indices
+
     @torch.inference_mode()
     def accept_draft_tokens(
         self,
@@ -966,6 +1199,20 @@ class ModelRunner:
         use_padded_kernels: bool = False,
     ) -> tuple[list[list[int]], torch.Tensor, torch.Tensor]:
         bs = len(seqs)
+        if (
+            bs > 0
+            and k_list
+            and all(k == k_list[0] for k in k_list)
+            and target_token_ids is None
+            and not use_padded_kernels
+        ):
+            return self.accept_greedy_target_ids(
+                draft_tokens,
+                target_logits.argmax(dim=-1),
+                k_list,
+                cu_q,
+            )
+
         out_tokens_per_seq: list[list[int]] = []
         accept_lens = torch.zeros(bs, dtype=torch.int32, device=target_logits.device)
         for b in range(bs):
@@ -1108,6 +1355,104 @@ class ModelRunner:
         return out_tokens_per_seq, accept_lens, next_prev_hidden_tensor, accepted_hidden_rows
 
     @torch.inference_mode()
+    def run_packed_verify(
+        self,
+        seqs: list[Sequence],
+        draft_tokens: torch.Tensor,
+        k_list: list[int],
+        temperatures: torch.Tensor,
+    ) -> tuple[
+        list[list[int]],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Verify every linear draft path with one target-model prefill."""
+        input_ids, positions, cu_q = self.prepare_spec_verify(
+            seqs,
+            draft_tokens,
+            k_list,
+        )
+        use_aux_hidden = bool(
+            getattr(self.draft_model, "use_aux_hidden_state", False)
+        )
+        if self.spec_debug:
+            self._spec_sync()
+            model_start = perf_counter()
+        graph_outputs = self.run_spec_verify_graph(
+            input_ids,
+            positions,
+            len(seqs),
+            k_list,
+        )
+        graph_target_ids = None
+        if graph_outputs is not None:
+            hidden_states, aux_hidden_states, graph_target_ids = graph_outputs
+            prev_hidden_source = (
+                aux_hidden_states if aux_hidden_states.numel() else hidden_states
+            )
+        elif use_aux_hidden:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                return_aux_hidden_states=True,
+                aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+            )
+            prev_hidden_source = (
+                aux_hidden_states if aux_hidden_states.numel() else hidden_states
+            )
+        else:
+            hidden_states = self.model(input_ids, positions)
+            prev_hidden_source = hidden_states
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["verify_model_time"] += perf_counter() - model_start
+            logits_start = perf_counter()
+        target_logits = (
+            None
+            if graph_target_ids is not None
+            else self.model.compute_logits(hidden_states)
+        )
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["verify_logits_time"] += perf_counter() - logits_start
+            accept_start = perf_counter()
+        reset_context()
+        if graph_target_ids is not None:
+            token_ids, accept_lens, prev_indices = (
+                self.accept_greedy_target_ids(
+                    draft_tokens,
+                    graph_target_ids,
+                    k_list,
+                    cu_q,
+                )
+            )
+        else:
+            token_ids, accept_lens, prev_indices = self.accept_draft_tokens(
+                seqs,
+                draft_tokens,
+                target_logits,
+                temperatures,
+                k_list,
+                cu_q,
+            )
+        next_prev_hidden = prev_hidden_source.index_select(
+            0,
+            prev_indices.to(torch.int64),
+        )
+        if self.spec_debug:
+            self._spec_sync()
+            self.spec_stats["verify_accept_time"] += perf_counter() - accept_start
+        return (
+            token_ids,
+            accept_lens,
+            next_prev_hidden,
+            prev_hidden_source,
+            cu_q,
+        )
+
+    @torch.inference_mode()
     def finalize_draft_cache(
         self,
         seqs: list[Sequence],
@@ -1126,8 +1471,8 @@ class ModelRunner:
         if not fin_mask.any():
             return
         block_tables = self.prepare_block_tables(seqs)
-        base_len = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        base_pos = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        base_len = torch.tensor([len(seq) - 1 for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        base_pos = torch.tensor([len(seq) - 2 for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         k_tensor = torch.tensor(k_list, dtype=torch.int64, device="cuda")
         last_draft_tokens = torch.tensor(
             [int(draft_tokens[i, k_list[i] - 1].item()) if k_list[i] > 0 else 0 for i in range(len(seqs))],
@@ -1136,7 +1481,7 @@ class ModelRunner:
         )
         final_slots = torch.tensor(
             [
-                self._slot_for_position(seq, len(seq) - 1 + k_list[i])
+                self._slot_for_position(seq, len(seq) - 2 + k_list[i])
                 for i, seq in enumerate(seqs)
             ],
             dtype=torch.int32,
@@ -1173,12 +1518,12 @@ class ModelRunner:
         for b, seq in enumerate(seqs):
             cache_tokens = token_ids[b][:-1]
             q_len = len(cache_tokens) + 1
-            k_len = len(seq) + len(cache_tokens)
+            k_len = len(seq) - 1 + len(cache_tokens)
             cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
             cu_seqlens_k.append(cu_seqlens_k[-1] + k_len)
             max_q = max(max_q, q_len)
             max_k = max(max_k, k_len)
-            base_pos = len(seq) - 1
+            base_pos = len(seq) - 2
             seq_input_ids = [seq.last_token, *cache_tokens]
             input_ids.extend(seq_input_ids)
             positions.extend(range(base_pos, base_pos + q_len))
@@ -1244,13 +1589,12 @@ class ModelRunner:
                     aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
                 )
                 prev_hidden_source = aux_hidden_states if aux_hidden_states.numel() else hidden_states
-                draft_hidden = self.draft_model.combine_hidden_states(prev_hidden_source)
             else:
                 hidden_states = self.model(input_ids, positions)
                 prev_hidden_source = hidden_states
-                draft_hidden = hidden_states
             logits = self.model.compute_logits(hidden_states)
-            self.fill_draft_cache_from_prefill(input_ids, positions, draft_hidden)
+            reset_context()
+            self.fill_draft_cache_from_prefill(seqs, prev_hidden_source)
             query_lens = [len(seq) - seq.num_cached_tokens for seq in seqs]
             last_query_indices = self._get_last_query_indices(query_lens, prev_hidden_source.device)
             prev_hidden = prev_hidden_source.index_select(0, last_query_indices)
@@ -1315,14 +1659,39 @@ class ModelRunner:
         if self.spec_debug:
             self._spec_sync()
             t0 = perf_counter()
-        token_ids, accept_lens, next_prev_hidden, accepted_hidden_rows = (
-            self.run_sequential_verify(
+        packed_verify = (
+            self.config.spec_verifier_mode == "packed"
+            and not use_tree_proposal
+            and self.world_size == 1
+        )
+        accepted_hidden_rows = None
+        packed_hidden_source = None
+        packed_cu_q = None
+        if packed_verify:
+            (
+                token_ids,
+                accept_lens,
+                next_prev_hidden,
+                packed_hidden_source,
+                packed_cu_q,
+            ) = self.run_packed_verify(
+                seqs,
+                draft_tokens,
+                k_list,
+                temperatures,
+            )
+        else:
+            (
+                token_ids,
+                accept_lens,
+                next_prev_hidden,
+                accepted_hidden_rows,
+            ) = self.run_sequential_verify(
                 seqs,
                 draft_tokens,
                 k_list,
                 tree_tokens if use_tree_proposal else None,
             )
-        )
         if self.spec_debug:
             self._spec_sync()
             self.spec_stats["verify_time"] += perf_counter() - t0
@@ -1343,17 +1712,22 @@ class ModelRunner:
             dist.broadcast(accept_lens, src=0)
         self._cache_prev_hidden(seqs, next_prev_hidden)
         if use_tree_proposal:
-            cu_q = torch.arange(
-                len(seqs) + 1,
-                dtype=torch.int32,
-                device=next_prev_hidden.device,
-            )
+            if packed_hidden_source is None:
+                replay_hidden_source = next_prev_hidden
+                replay_cu_q = torch.arange(
+                    len(seqs) + 1,
+                    dtype=torch.int32,
+                    device=next_prev_hidden.device,
+                )
+            else:
+                replay_hidden_source = packed_hidden_source
+                replay_cu_q = packed_cu_q
             self.replay_draft_cache(
                 seqs,
                 token_ids,
                 prev_token_hidden,
-                next_prev_hidden,
-                cu_q,
+                replay_hidden_source,
+                replay_cu_q,
                 accepted_hidden_rows=accepted_hidden_rows,
             )
         else:
@@ -1369,6 +1743,113 @@ class ModelRunner:
         return self.run_spec_decode(seqs)
 
     @torch.inference_mode()
+    def run_spec_verify_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch_size: int,
+        k_list: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if (
+            self.enforce_eager
+            or not hasattr(self, "spec_verify_graphs")
+            or not k_list
+            or any(k != self.spec_verify_query_len - 1 for k in k_list)
+        ):
+            return None
+        context = get_context()
+        if (
+            context.max_seqlen_k > self.spec_verify_max_seqlen_k
+            or context.cu_seqlens_k is None
+            or context.slot_mapping is None
+            or context.block_tables is None
+        ):
+            return None
+        graph_bs = next(
+            (size for size in self.spec_graph_bs if size >= batch_size),
+            None,
+        )
+        if graph_bs is None or graph_bs not in self.spec_verify_graphs:
+            return None
+
+        variables = self.spec_verify_graph_vars
+        query_len = self.spec_verify_query_len
+        num_tokens = batch_size * query_len
+        graph_tokens = graph_bs * query_len
+        variables["input_ids"][:num_tokens].copy_(input_ids)
+        variables["input_ids"][num_tokens:graph_tokens].zero_()
+        variables["positions"][:num_tokens].copy_(positions)
+        variables["positions"][num_tokens:graph_tokens].zero_()
+        variables["slot_mapping"][:graph_tokens].fill_(-1)
+        variables["slot_mapping"][:num_tokens].copy_(context.slot_mapping)
+
+        variables["cu_seqlens_k"][: batch_size + 1].copy_(
+            context.cu_seqlens_k
+        )
+        if graph_bs > batch_size:
+            tail = torch.arange(
+                1,
+                graph_bs - batch_size + 1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            variables["cu_seqlens_k"][batch_size + 1 : graph_bs + 1].copy_(
+                context.cu_seqlens_k[-1] + tail * query_len
+            )
+        variables["block_tables"][:graph_bs].zero_()
+        variables["block_tables"][
+            :batch_size, : context.block_tables.size(1)
+        ].copy_(context.block_tables)
+
+        self.spec_verify_graphs[graph_bs].replay()
+        return (
+            variables["outputs"][:num_tokens],
+            variables["aux_outputs"][:num_tokens],
+            variables["target_ids"][:num_tokens],
+        )
+
+    @torch.inference_mode()
+    def run_draft_step_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_inputs: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if self.enforce_eager or not hasattr(self, "draft_step_graphs"):
+            return None
+        batch_size = input_ids.size(0)
+        graph_bs = next(
+            (size for size in self.spec_graph_bs if size >= batch_size),
+            None,
+        )
+        if graph_bs is None or graph_bs not in self.draft_step_graphs:
+            return None
+        variables = self.draft_step_graph_vars
+        variables["input_ids"][:batch_size].copy_(input_ids)
+        variables["input_ids"][batch_size:graph_bs].zero_()
+        variables["positions"][:batch_size].copy_(positions)
+        variables["positions"][batch_size:graph_bs].zero_()
+        variables["hidden_inputs"][:batch_size].copy_(hidden_inputs)
+        variables["hidden_inputs"][batch_size:graph_bs].zero_()
+        variables["slot_mapping"][:graph_bs].fill_(-1)
+        variables["slot_mapping"][:batch_size].copy_(slot_mapping)
+        variables["context_lens"][:batch_size].copy_(context_lens)
+        variables["context_lens"][batch_size:graph_bs].fill_(1)
+        variables["block_tables"][:graph_bs].zero_()
+        variables["block_tables"][
+            :batch_size, : block_tables.size(1)
+        ].copy_(block_tables)
+        self.draft_step_graphs[graph_bs].replay()
+        return (
+            variables["hidden_outputs"][:batch_size],
+            variables["next_hidden"][:batch_size],
+            variables["target_ids"][:batch_size],
+        )
+
+    @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
@@ -1380,7 +1861,13 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        graph_bs_candidates = [1, 2, 4, 8] + list(
+            range(16, max_bs + 1, 16)
+        )
+        self.graph_bs = sorted(
+            {size for size in graph_bs_candidates if size <= max_bs}
+            | {max_bs}
+        )
         self.graphs = {}
         self.graph_pool = None
 
@@ -1404,3 +1891,204 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    @torch.inference_mode()
+    def capture_spec_verify_cudagraph(self) -> None:
+        """Capture the common fixed-K packed verifier with padded batch sizes."""
+        query_len = self.config.num_spec_tokens + 1
+        if query_len <= 1:
+            self.spec_verify_graphs = {}
+            return
+        self.spec_graph_bs = [
+            size for size in self.graph_bs if size <= 64
+        ]
+        max_bs = max(self.spec_graph_bs)
+        max_tokens = max_bs * query_len
+        max_num_blocks = (
+            self.config.max_model_len + self.block_size - 1
+        ) // self.block_size
+        input_ids = torch.zeros(max_tokens, dtype=torch.int64)
+        positions = torch.arange(
+            query_len,
+            dtype=torch.int64,
+        ).repeat(max_bs)
+        slot_mapping = (
+            torch.arange(max_tokens, dtype=torch.int32) % self.block_size
+        )
+        cu_seqlens_q = (
+            torch.arange(max_bs + 1, dtype=torch.int32) * query_len
+        )
+        cu_seqlens_k = cu_seqlens_q.clone()
+        block_tables = torch.zeros(
+            max_bs,
+            max_num_blocks,
+            dtype=torch.int32,
+        )
+        hidden_size = self.config.hf_config.hidden_size
+        outputs = torch.zeros(max_tokens, hidden_size)
+        target_ids = torch.zeros(max_tokens, dtype=torch.int64)
+        use_aux_hidden = bool(
+            getattr(self.draft_model, "use_aux_hidden_state", False)
+        )
+        aux_width = (
+            hidden_size * len(self.eagle_aux_hidden_state_layer_ids)
+            if use_aux_hidden
+            else 0
+        )
+        aux_outputs = torch.zeros(max_tokens, aux_width)
+        self.spec_verify_query_len = query_len
+        # The resume workload reaches 256 tokens. A 320-token graph keeps the
+        # common path fast while longer contexts safely fall back to eager.
+        self.spec_verify_max_seqlen_k = min(
+            self.config.max_model_len + self.config.num_spec_tokens,
+            320,
+        )
+        self.spec_verify_graphs = {}
+
+        for bs in reversed(self.spec_graph_bs):
+            num_tokens = bs * query_len
+            graph = torch.cuda.CUDAGraph()
+            set_context(
+                True,
+                cu_seqlens_q[: bs + 1],
+                cu_seqlens_k[: bs + 1],
+                query_len,
+                self.spec_verify_max_seqlen_k,
+                slot_mapping[:num_tokens],
+                None,
+                block_tables[:bs],
+                prefill_last_only=False,
+            )
+            if use_aux_hidden:
+                warmup_hidden, warmup_aux = self.model(
+                    input_ids[:num_tokens],
+                    positions[:num_tokens],
+                    return_aux_hidden_states=True,
+                    aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+                )
+                outputs[:num_tokens].copy_(warmup_hidden)
+                aux_outputs[:num_tokens].copy_(warmup_aux)
+                target_ids[:num_tokens].copy_(
+                    self.model.compute_logits(warmup_hidden).argmax(dim=-1)
+                )
+                with torch.cuda.graph(graph, self.graph_pool):
+                    graph_hidden, graph_aux = self.model(
+                        input_ids[:num_tokens],
+                        positions[:num_tokens],
+                        return_aux_hidden_states=True,
+                        aux_hidden_state_layer_ids=self.eagle_aux_hidden_state_layer_ids,
+                    )
+                    outputs[:num_tokens].copy_(graph_hidden)
+                    aux_outputs[:num_tokens].copy_(graph_aux)
+                    target_ids[:num_tokens].copy_(
+                        self.model.compute_logits(graph_hidden).argmax(dim=-1)
+                    )
+            else:
+                warmup_hidden = self.model(
+                    input_ids[:num_tokens],
+                    positions[:num_tokens],
+                )
+                outputs[:num_tokens].copy_(warmup_hidden)
+                target_ids[:num_tokens].copy_(
+                    self.model.compute_logits(warmup_hidden).argmax(dim=-1)
+                )
+                with torch.cuda.graph(graph, self.graph_pool):
+                    graph_hidden = self.model(
+                        input_ids[:num_tokens],
+                        positions[:num_tokens],
+                    )
+                    outputs[:num_tokens].copy_(graph_hidden)
+                    target_ids[:num_tokens].copy_(
+                        self.model.compute_logits(graph_hidden).argmax(dim=-1)
+                    )
+            self.spec_verify_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.spec_verify_graph_vars = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "slot_mapping": slot_mapping,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "block_tables": block_tables,
+            "outputs": outputs,
+            "aux_outputs": aux_outputs,
+            "target_ids": target_ids,
+        }
+
+    @torch.inference_mode()
+    def capture_draft_step_cudagraph(self) -> None:
+        """Capture one EAGLE draft decode step for the common batch buckets."""
+        max_bs = max(self.spec_graph_bs)
+        max_num_blocks = (
+            self.config.max_model_len + self.block_size - 1
+        ) // self.block_size
+        hidden_size = self.config.draft_hf_config.hidden_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        hidden_inputs = torch.zeros(max_bs, hidden_size)
+        slot_mapping = torch.arange(max_bs, dtype=torch.int32)
+        context_lens = torch.ones(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(
+            max_bs,
+            max_num_blocks,
+            dtype=torch.int32,
+        )
+        hidden_outputs = torch.zeros(max_bs, hidden_size)
+        next_hidden = torch.zeros(max_bs, hidden_size)
+        target_ids = torch.zeros(max_bs, dtype=torch.int64)
+        self.draft_step_graphs = {}
+
+        for bs in reversed(self.spec_graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+            )
+            warmup_output, warmup_next = (
+                self.draft_model.forward_with_hidden(
+                    input_ids[:bs],
+                    positions[:bs],
+                    hidden_inputs[:bs],
+                )
+            )
+            warmup_target_ids = self.draft_model.map_draft_to_target(
+                self.draft_model.compute_logits(warmup_output).argmax(dim=-1)
+            )
+            hidden_outputs[:bs].copy_(warmup_output)
+            next_hidden[:bs].copy_(warmup_next)
+            target_ids[:bs].copy_(warmup_target_ids)
+            with torch.cuda.graph(graph, self.graph_pool):
+                graph_output, graph_next = (
+                    self.draft_model.forward_with_hidden(
+                        input_ids[:bs],
+                        positions[:bs],
+                        hidden_inputs[:bs],
+                    )
+                )
+                graph_target_ids = self.draft_model.map_draft_to_target(
+                    self.draft_model.compute_logits(graph_output).argmax(
+                        dim=-1
+                    )
+                )
+                hidden_outputs[:bs].copy_(graph_output)
+                next_hidden[:bs].copy_(graph_next)
+                target_ids[:bs].copy_(graph_target_ids)
+            self.draft_step_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.draft_step_graph_vars = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "hidden_inputs": hidden_inputs,
+            "slot_mapping": slot_mapping,
+            "context_lens": context_lens,
+            "block_tables": block_tables,
+            "hidden_outputs": hidden_outputs,
+            "next_hidden": next_hidden,
+            "target_ids": target_ids,
+        }
