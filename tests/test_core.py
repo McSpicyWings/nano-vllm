@@ -78,6 +78,20 @@ def test_spec_stats_use_sequence_level_denominator_and_reset() -> None:
     assert runner.spec_stats["sequence_proposals"] == 0
 
 
+def test_small_batch_fallback_is_sticky_and_cleans_up() -> None:
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(spec_decode_min_batch_size=3)
+    runner.seq_prev_hidden = {}
+    runner.spec_disabled_seq_ids = set()
+    seqs = [SimpleNamespace(seq_id=10), SimpleNamespace(seq_id=11)]
+
+    assert not runner.should_use_spec_decode(seqs)
+    runner.config.spec_decode_min_batch_size = 1
+    assert not runner.should_use_spec_decode(seqs)
+    runner.release_sequences([10, 11])
+    assert not runner.spec_disabled_seq_ids
+
+
 def test_tree_parser_validates_prefixes_and_depth() -> None:
     runner = object.__new__(ModelRunner)
     runner.config = SimpleNamespace(

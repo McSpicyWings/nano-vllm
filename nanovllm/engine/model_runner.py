@@ -52,6 +52,7 @@ class ModelRunner:
         )
         self.eagle_aux_hidden_state_layer_ids: list[int] | None = None
         self.seq_prev_hidden: dict[int, torch.Tensor] = {}
+        self.spec_disabled_seq_ids: set[int] = set()
         self.spec_token_tree = self._build_spec_token_tree()
         self.spec_tree_leaf_paths = self._get_tree_leaf_paths(self.spec_token_tree)
         self.spec_tree_nodes_by_level = self._get_tree_nodes_by_level(self.spec_token_tree)
@@ -318,6 +319,17 @@ class ModelRunner:
     def release_sequences(self, seq_ids: list[int]) -> None:
         for seq_id in seq_ids:
             self.seq_prev_hidden.pop(seq_id, None)
+            self.spec_disabled_seq_ids.discard(seq_id)
+
+    def should_use_spec_decode(self, seqs: list[Sequence]) -> bool:
+        """Keep a shrunken batch on baseline once tail fallback has started."""
+        if any(seq.seq_id in self.spec_disabled_seq_ids for seq in seqs):
+            self.spec_disabled_seq_ids.update(seq.seq_id for seq in seqs)
+            return False
+        if len(seqs) < self.config.spec_decode_min_batch_size:
+            self.spec_disabled_seq_ids.update(seq.seq_id for seq in seqs)
+            return False
+        return True
 
     def _cache_prev_hidden(self, seqs: list[Sequence], prev_hidden: torch.Tensor) -> None:
         for i, seq in enumerate(seqs):
@@ -1738,7 +1750,12 @@ class ModelRunner:
         return token_ids
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[list[int]] | None:
-        if is_prefill or self.draft_model is None or self.config.num_spec_tokens <= 0:
+        if (
+            is_prefill
+            or self.draft_model is None
+            or self.config.num_spec_tokens <= 0
+            or not self.should_use_spec_decode(seqs)
+        ):
             return self.run_baseline(seqs, is_prefill)
         return self.run_spec_decode(seqs)
 

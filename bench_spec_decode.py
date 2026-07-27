@@ -170,6 +170,7 @@ def _run_case_worker(
     warmup_runs: int,
     num_spec_tokens: int,
     spec_verifier_mode: str,
+    spec_decode_min_batch_size: int,
     speculative_token_tree: str,
     max_model_len: int,
     num_kvcache_blocks: int,
@@ -189,6 +190,7 @@ def _run_case_worker(
             "num_kvcache_blocks": num_kvcache_blocks,
             "num_spec_tokens": num_spec_tokens,
             "spec_verifier_mode": spec_verifier_mode,
+            "spec_decode_min_batch_size": spec_decode_min_batch_size,
         }
         if case_name != "nano_baseline":
             kwargs["draft_model"] = draft_model
@@ -298,6 +300,10 @@ def render_markdown(result: dict[str, Any]) -> str:
             f"- workload: batch={config['batch_size']}, input={config['input_length']}, "
             f"output={config['output_length']}, greedy, repeats={config['repeats']}"
         ),
+        (
+            "- speculative tail fallback: active batch "
+            f"< {config['spec_decode_min_batch_size']} switches to baseline decode"
+        ),
         f"- workload SHA256: `{config['workload_sha256']}`",
         "",
         "| Case | Output tok/s | TTFT mean (ms) | TPOT mean (ms) | Acceptance | Accept length | Peak allocated (GiB) |",
@@ -340,6 +346,12 @@ def parse_args() -> argparse.Namespace:
         choices=["packed", "sequential"],
         default="packed",
     )
+    parser.add_argument(
+        "--spec-decode-min-batch-size",
+        type=int,
+        default=0,
+        help="sticky baseline fallback threshold; 0 uses the initial batch size",
+    )
     parser.add_argument("--speculative-token-tree", default=DEFAULT_TREE)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--num-kvcache-blocks", type=int, default=64)
@@ -366,6 +378,13 @@ def main() -> None:
     prompt_token_ids = build_fixed_length_prompts(
         tokenizer, args.batch_size, args.input_length
     )
+    spec_decode_min_batch_size = (
+        args.batch_size
+        if args.spec_decode_min_batch_size == 0
+        else args.spec_decode_min_batch_size
+    )
+    if spec_decode_min_batch_size < 1:
+        raise ValueError("--spec-decode-min-batch-size must be >= 1, or 0 for batch size")
     common = {
         "target_model": args.target_model,
         "draft_model": args.draft_model,
@@ -375,6 +394,7 @@ def main() -> None:
         "warmup_runs": args.warmup_runs,
         "num_spec_tokens": args.num_spec_tokens,
         "spec_verifier_mode": args.spec_verifier_mode,
+        "spec_decode_min_batch_size": spec_decode_min_batch_size,
         "speculative_token_tree": args.speculative_token_tree,
         "max_model_len": args.max_model_len,
         "num_kvcache_blocks": args.num_kvcache_blocks,
@@ -397,6 +417,7 @@ def main() -> None:
             "seed": args.seed,
             "num_spec_tokens": args.num_spec_tokens,
             "spec_verifier_mode": args.spec_verifier_mode,
+            "spec_decode_min_batch_size": spec_decode_min_batch_size,
             "speculative_token_tree": args.speculative_token_tree,
             "max_model_len": args.max_model_len,
             "num_kvcache_blocks": args.num_kvcache_blocks,

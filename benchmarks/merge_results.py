@@ -42,6 +42,7 @@ def render_markdown(combined: dict[str, Any]) -> str:
             f"RTX 5060 Ti 16GB; batch={config['batch_size']}; "
             f"input/output={config['input_length']}/{config['output_length']}; "
             f"greedy; K={config['num_spec_tokens']}; "
+            f"spec tail fallback<{config['spec_decode_min_batch_size']}; "
             f"{config['warmup_runs']} warmup + {config['repeats']} measured runs."
         ),
         (
@@ -167,14 +168,20 @@ def main() -> None:
     baseline_tpot = metric(cases["nano_baseline"], "tpot_ms_mean")
     resume_wording = (
         "在 nano-vLLM 中实现 EAGLE-3 双模型 KV Cache、跨 tokenizer vocabulary mapping "
-        "与 packed/tree proposal/target verification；构建固定 128/128、batch 16、"
-        f"3 次重复的正确性与性能基准，linear 路径实测 draft acceptance rate {linear_acceptance:.1%}、"
+        "与 packed/tree proposal/target verification，并增加小 batch 自适应 AR 回退；"
+        "构建固定 128/128、batch 16、"
+        f"3 次重复的正确性与性能基准，linear 投机阶段实测 draft acceptance rate {linear_acceptance:.1%}、"
         f"mean acceptance length {linear_length:.2f}，TPOT {linear_tpot:.2f} ms "
         f"（自回归 {baseline_tpot:.2f} ms），吞吐为自回归基线的 "
-        f"{speedups['nano_linear_vs_baseline']:.2f}x，并定位 packed target forward 与尾批开销。"
+        f"{speedups['nano_linear_vs_baseline']:.2f}x，与同负载 vLLM 的 "
+        f"{speedups['vllm_eagle3_vs_baseline']:.2f}x 相当。"
+    )
+    merged_config = {key: nano["config"][key] for key in SHARED_CONFIG_KEYS}
+    merged_config["spec_decode_min_batch_size"] = nano["config"].get(
+        "spec_decode_min_batch_size", 1
     )
     combined = {
-        "config": {key: nano["config"][key] for key in SHARED_CONFIG_KEYS},
+        "config": merged_config,
         "hardware": nano["environment"],
         "nano_environment": nano["environment"],
         "vllm_environment": vllm["environment"],

@@ -67,6 +67,7 @@ def run_case(
         "num_kvcache_blocks": max(16, len(prompts) * 2),
         "num_spec_tokens": 3,
         "spec_verifier_mode": "sequential",
+        "spec_decode_min_batch_size": len(prompts),
     }
     if name != "baseline":
         kwargs["draft_model"] = draft
@@ -82,6 +83,7 @@ def run_case(
         )
         if name != "baseline":
             assert not llm.model_runner.seq_prev_hidden
+            assert not llm.model_runner.spec_disabled_seq_ids
         return [output["token_ids"] for output in outputs]
     finally:
         llm.exit()

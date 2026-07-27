@@ -11,9 +11,10 @@ draft/target 双模型执行、两套 KV Cache、EAGLE hidden states、跨 token
 词表映射、线性和多分支 tree proposal、target verification、回滚和指标采集。
 
 项目当前仍没有取得正吞吐加速，但已经修复了 EAGLE-3 token/hidden shift、
-draft KV 位置和 target auxiliary hidden-state 对齐问题。固定负载下，优化后的
-linear packed 路径吞吐为普通自回归的 `0.80x`，TPOT 从 `10.38 ms` 降到
-`8.13 ms`。这里保留负结果，因为完整 target 词表验证和可复现数据比一个好看的
+draft KV 位置和 target auxiliary hidden-state 对齐问题，并为低效尾批增加
+sticky AR fallback。固定负载下，优化后的 linear packed 路径吞吐为普通自回归的
+`0.95x`，与同负载 vLLM 的 `0.945x` 相当；TPOT 从 `10.37 ms` 降到
+`7.56 ms`。这里保留负结果，因为完整 target 词表验证和可复现数据比一个好看的
 加速数字更重要。
 
 ## English summary
@@ -21,10 +22,11 @@ linear packed 路径吞吐为普通自回归的 `0.80x`，TPOT 从 `10.38 ms` �
 This fork adds a correctness-first EAGLE-3 speculative decoding path to
 nano-vLLM, including dual model execution, separate KV caches, EAGLE hidden
 states, tokenizer vocabulary mapping, linear and tree proposals, target
-verification, rollback, and reproducible metrics. On the documented RTX 5060 Ti
-workload, the optimized linear packed path reaches 0.80x of autoregressive
-throughput while reducing per-request TPOT. The remaining negative result and
-its bottlenecks are reported as measured.
+verification, rollback, adaptive tail fallback, and reproducible metrics. On
+the documented RTX 5060 Ti workload, the optimized linear packed path reaches
+0.95x of autoregressive throughput, comparable to vLLM's measured 0.945x, while
+reducing per-request TPOT. The remaining negative result and its bottlenecks are
+reported as measured.
 
 ## 实现范围
 
@@ -43,6 +45,9 @@ its bottlenecks are reported as measured.
 - `spec_verifier_mode="sequential"` 保留逐 token target 验证，用于与 baseline
   做严格正确性回归。packed 与动态尾批可能因 BF16 GEMM shape 不同而改变近似
   argmax，因此性能输出摘要不作为严格正确性依据。
+- `spec_decode_min_batch_size` 可在 active batch 低于阈值后粘滞切回普通解码，
+  避免 padded speculative tail 拖慢整批；同一请求在完成前不会恢复使用过期的
+  draft KV。引擎默认值为 1，正式离线 benchmark 使用 16。
 - Scheduler 为 proposal 预留 KV block，验证后回滚未接受位置。tree 路径会把实际
   接受序列 replay 到 draft KV Cache。
 - 请求结束后释放 target/draft block，并清理 `seq_prev_hidden`。
@@ -104,6 +109,7 @@ llm = LLM(
     draft_model="./huggingface/AngelSlim/Qwen3-1.7B_eagle3",
     num_spec_tokens=3,
     spec_verifier_mode="packed",
+    spec_decode_min_batch_size=16,
     max_model_len=2048,
 )
 outputs = llm.generate(
@@ -160,8 +166,9 @@ PYTHONNOUSERSITE=1 python tests/test_eagle3_correctness.py
 
 正式负载固定为 RTX 5060 Ti 16GB、Qwen3-1.7B target、
 AngelSlim/Qwen3-1.7B_eagle3 draft、TP=1、batch 16、输入和输出各 128 token、
-greedy、`ignore_eos=True`、seed 42、K=3、`max_model_len=2048`。16 个自然语言
-prompt 经同一 tokenizer 确定性补齐或截断，workload SHA256 为
+greedy、`ignore_eos=True`、seed 42、K=3、`max_model_len=2048`。linear/tree
+在 active batch 小于 16 时粘滞切回普通解码。16 个自然语言 prompt 经同一
+tokenizer 确定性补齐或截断，workload SHA256 为
 `6cc3bda376604d06b504f2f16d1c1abe8bd36dc64d3518bf7b14391d5e1790e7`。
 
 每个 case 加载一次模型，执行 1 次预热和 3 次正式测试：
@@ -170,6 +177,8 @@ prompt 经同一 tokenizer 确定性补齐或截断，workload SHA256 为
 - throughput 等于实际 output tokens 除以批次墙钟时间。
 - acceptance rate 等于 accepted draft tokens 除以 proposed path tokens。
 - acceptance length 等于 emitted tokens 除以 sequence-level proposals。
+- 两个 acceptance 指标只统计实际执行的 speculative proposals，不把 AR
+  fallback 尾批混入分子或分母。
 - nano linear 性能使用 packed verifier；tree 当前仍使用 sequential verifier，
   因而是功能/瓶颈诊断项，不与 vLLM linear EAGLE 路径直接比较。
 - nano 的峰值是 PyTorch allocator peak，包含权重、固定 64-block target/draft KV
@@ -183,15 +192,19 @@ vLLM 对比环境为 v0.13.0、PyTorch 2.9.0+cu128。
 
 | Case | output tok/s, mean ± std | TTFT ms, mean ± std | TPOT ms, mean ± std | acceptance rate | acceptance length | peak GiB |
 |---|---:|---:|---:|---:|---:|---:|
-| nano baseline | 1406.88 ± 0.95 | 137.68 ± 0.37 | 10.38 ± 0.01 | - | - | 5.10 |
-| nano EAGLE-3 linear packed | 1124.60 ± 10.71 | 144.96 ± 0.09 | 8.13 ± 0.05 | 47.03% | 2.385 | 5.47 |
-| nano EAGLE-3 tree sequential | 248.26 ± 0.27 | 144.99 ± 0.09 | 48.60 ± 0.05 | 49.63% | 2.460 | 5.47 |
+| nano baseline | 1407.53 ± 0.77 | 137.70 ± 0.21 | 10.37 ± 0.00 | - | - | 5.10 |
+| nano EAGLE-3 linear packed + tail fallback | 1337.26 ± 1.01 | 145.46 ± 0.08 | 7.56 ± 0.01 | 64.51% | 2.928 | 5.47 |
+| nano EAGLE-3 tree sequential + tail fallback | 363.41 ± 1.83 | 145.67 ± 0.28 | 40.18 ± 0.23 | 65.34% | 2.959 | 5.47 |
 | vLLM baseline | 1366.24 ± 1.94 | 138.94 ± 0.13 | 10.70 ± 0.02 | - | - | 12.15 |
 | vLLM EAGLE-3 | 1291.15 ± 80.52 | 221.83 ± 101.27 | 7.72 ± 0.03 | 38.05% | 2.142 | 12.92 |
 
-nano linear 为 baseline 的 `0.799x`，tree 为 `0.176x`。vLLM EAGLE-3 为其
-baseline 的 `0.945x`。相较修复前的正式数据，nano linear acceptance rate 从
-`1.66%` 提升到 `47.03%`，吞吐从 `287.59` 提升到 `1124.60 tok/s`。
+nano linear 为 baseline 的 `0.950x`，tree 为 `0.258x`。vLLM EAGLE-3 为其
+baseline 的 `0.945x`。相较修复前的正式数据，nano linear 投机阶段 acceptance
+rate 从 `1.66%` 提升到 `64.51%`，吞吐从 `287.59` 提升到
+`1337.26 tok/s`。关闭 tail fallback 的同一修复版本为 `1124.60 tok/s`
+（`0.799x`），说明剩余整体吞吐差距主要来自低利用率尾批。
+阈值消融记录见
+[`nano_tail_fallback_ablation.md`](benchmarks/results/diagnostics/nano_tail_fallback_ablation.md)。
 
 严格 sequential gate 中，nano baseline、linear、tree 在 batch 1/16 和 KV block
 边界逐 token 完全一致。性能 benchmark 的 packed/dynamic-tail 摘要与 baseline
@@ -211,8 +224,8 @@ step 的 draft、target verification、accept/cache 分别约为 2.37、21.06、
 ## 已知限制
 
 - EAGLE-3 只支持 greedy。正温度 rejection sampling 不在本轮范围内。
-- linear packed 虽有 47.0% acceptance rate，但 target verification 和动态尾批
-  仍使总吞吐低于 baseline；当前不能宣称正加速。
+- linear packed + tail fallback 的吞吐为 baseline 的 0.95x；仍不是正加速，
+  且该策略面向固定离线 batch，在线服务需要结合调度负载动态选择阈值。
 - packed verifier 与 baseline 可能因 BF16 batch shape 产生不同 greedy argmax；
   需要逐 token 一致性时使用 sequential verifier。
 - tree proposal 仍包含 Python 控制流、逐层 attention metadata 和 cache replay。
@@ -227,9 +240,10 @@ step 的 draft、target verification、accept/cache 分别约为 2.37、21.06、
 
 > 在 nano-vLLM 中实现 EAGLE-3 双模型 KV Cache、跨 tokenizer vocabulary
 > mapping 与 packed/tree proposal/target verification；构建固定 128/128、
-> batch 16、3 次重复的正确性与性能基准，修复 token/hidden/KV 对齐后将 linear
-> draft acceptance rate 从 1.66% 提升到 47.03%、mean acceptance length 提升到
-> 2.38，TPOT 由自回归的 10.38 ms 降至 8.13 ms，吞吐达到 baseline 的 0.80x，
-> 并定位 packed target forward 与动态尾批为剩余瓶颈。
+> batch 16、3 次重复的正确性与性能基准；修复 token/hidden/KV 对齐并增加
+> 小 batch 自适应 AR 回退，将 linear 投机阶段 draft acceptance rate 从 1.66%
+> 提升到 64.51%、mean acceptance length 提升到 2.93，TPOT 由自回归的
+> 10.37 ms 降至 7.56 ms，吞吐达到 baseline 的 0.95x，与同负载 vLLM 的
+> 0.945x 相当。
 
 项目仓库：[McSpicyWings/nano-vllm](https://github.com/McSpicyWings/nano-vllm)
